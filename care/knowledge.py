@@ -1,7 +1,7 @@
 """Knowledge source: bundles and FAQs. (Not named catalogue.py: that shadows a spaCy dependency.)
 
 SAMPLE DATA ONLY. Names and prices are invented for the prototype and are not
-real Econet products. This module is the single source of truth for prices;
+real products. This module is the single source of truth for prices;
 every document carries an effective window so stale content is never served.
 """
 from datetime import date

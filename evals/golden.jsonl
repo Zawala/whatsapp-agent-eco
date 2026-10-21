@@ -18,7 +18,7 @@
 {"text": "I can't send SMS, it keeps failing", "intent": "fault_report", "high_risk": false}
 {"text": "I want to do a SIM swap", "intent": "other", "high_risk": true}
 {"text": "My phone was stolen, please replace my SIM", "intent": "other", "high_risk": true}
-{"text": "I forgot my EcoCash PIN", "intent": "other", "high_risk": true}
+{"text": "I forgot my mobile money PIN", "intent": "other", "high_risk": true}
 {"text": "Please reset my PUK", "intent": "other", "high_risk": true}
 {"text": "I sent money to the wrong number, please reverse it", "intent": "other", "high_risk": true}
 {"text": "I want a refund for the bundle I bought by mistake", "intent": "other", "high_risk": true}

@@ -10,7 +10,7 @@ the LLM only classifies messages and phrases bundle answers. Everything that
 matters is decided by plain code.
 
 > **Sample data only.** Bundle names, prices and backends are invented and are
-> not real Econet products or systems.
+> not real products or systems.
 
 ## How a message is handled
 
