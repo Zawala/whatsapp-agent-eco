@@ -1,0 +1,3 @@
+# Labels of our self-hosted runners (see .github/workflows/evals.yml).
+self-hosted-runner:
+  labels: [ollama]

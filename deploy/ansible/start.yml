@@ -1,0 +1,181 @@
+# Start care-bot and everything it needs, in order:
+#   Python venv -> Ollama + model -> Postgres -> migrations -> API (systemd user service)
+#
+#   ansible-playbook -i deploy/ansible/inventory.ini deploy/ansible/start.yml
+#   ... -e postgres_mode=system      # use the machine's Postgres instead of Docker
+#
+# Needs sudo for the Ollama and system Postgres services (add -K if sudo asks
+# for a password). Safe to rerun; the API is always restarted to pick up code changes.
+- name: Start care-bot
+  hosts: localhost
+  gather_facts: true
+  gather_subset: [min]
+  vars_files: [vars.yml]
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ lookup('pipe', 'id -u') }}"   # for systemctl --user
+
+  tasks:
+    # --- preflight -------------------------------------------------------------
+    - name: Check postgres_mode
+      ansible.builtin.assert:
+        that: postgres_mode in ['docker', 'system']
+        fail_msg: "postgres_mode must be docker or system, got {{ postgres_mode }}"
+
+    - name: Check the Docker engine is running
+      when: postgres_mode == 'docker'
+      block:
+        - name: Ask Docker for its status
+          ansible.builtin.command: docker info --format '{{ "{{" }}.ServerVersion{{ "}}" }}'
+          changed_when: false
+      rescue:
+        - name: Explain what to do
+          ansible.builtin.fail:
+            msg: >-
+              The Docker engine isn't reachable. Install or start it (sudo systemctl start docker),
+              or rerun with -e postgres_mode=system to use the machine's Postgres.
+
+    # --- python ----------------------------------------------------------------
+    - name: Check for the venv
+      ansible.builtin.stat:
+        path: "{{ venv }}/bin/python"
+      register: venv_python
+
+    - name: Create the venv and install requirements (first run, or -e install_deps=true)
+      ansible.builtin.pip:
+        requirements: "{{ repo_dir }}/requirements.txt"
+        virtualenv: "{{ venv }}"
+        virtualenv_command: python3 -m venv
+      when: not venv_python.stat.exists or (install_deps | default(false) | bool)
+
+    # --- ollama ----------------------------------------------------------------
+    - name: Start Ollama
+      ansible.builtin.systemd_service:
+        name: ollama
+        state: started
+      become: true
+      when: manage_ollama | bool
+
+    - name: Wait for Ollama
+      ansible.builtin.wait_for:
+        port: 11434
+        host: 127.0.0.1
+        timeout: 60
+
+    - name: Check the model is pulled
+      ansible.builtin.command: ollama show {{ ollama_model }}
+      register: model_present
+      changed_when: false
+      failed_when: false
+
+    - name: Pull the model if missing (can take a while)
+      ansible.builtin.command: ollama pull {{ ollama_model }}
+      when: model_present.rc != 0
+      changed_when: true
+
+    # --- postgres --------------------------------------------------------------
+    - name: Start Postgres (Docker)
+      ansible.builtin.command: docker compose up -d --wait
+      args:
+        chdir: "{{ repo_dir }}"
+      environment:
+        CARE_PG_PORT: "{{ postgres_port }}"
+      register: compose_up
+      changed_when: "'Started' in compose_up.stderr or 'Created' in compose_up.stderr"
+      when: postgres_mode == 'docker'
+
+    - name: Start and prepare the system Postgres
+      when: postgres_mode == 'system'
+      become: true
+      become_user: postgres
+      block:
+        - name: Start the postgresql service
+          ansible.builtin.systemd_service:
+            name: postgresql
+            state: started
+          become: true
+          become_user: root
+
+        - name: Check for the care role
+          ansible.builtin.command: psql -tAc "SELECT 1 FROM pg_roles WHERE rolname = 'care'"
+          register: role_exists
+          changed_when: false
+
+        - name: Create the care role
+          ansible.builtin.command: psql -c "CREATE ROLE care LOGIN PASSWORD '{{ postgres_password }}'"
+          when: role_exists.stdout != '1'
+          changed_when: true
+
+        - name: Check for the databases
+          ansible.builtin.command: psql -tAc "SELECT datname FROM pg_database WHERE datname IN ('care', 'care_test')"
+          register: dbs_present
+          changed_when: false
+
+        - name: Create missing databases
+          ansible.builtin.command: createdb -O care {{ item }}
+          loop: [care, care_test]
+          when: item not in dbs_present.stdout_lines
+          changed_when: true
+
+    - name: Apply database migrations
+      ansible.builtin.command: "{{ venv }}/bin/alembic upgrade head"
+      args:
+        chdir: "{{ repo_dir }}"
+      environment:
+        CARE_DATABASE_URL: "{{ database_url }}"
+      register: migrate
+      changed_when: "'Running upgrade' in migrate.stderr"
+
+    # --- API -------------------------------------------------------------------
+    - name: Create the config directory
+      ansible.builtin.file:
+        path: "{{ config_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Write the API env file (token is generated once and kept)
+      ansible.builtin.template:
+        src: env.j2
+        dest: "{{ config_dir }}/env"
+        mode: "0600"
+      vars:
+        api_token: "{{ lookup('ansible.builtin.password', config_dir + '/api_token', length=40, chars=['ascii_letters', 'digits']) }}"
+
+    - name: Lock down the token file
+      ansible.builtin.file:
+        path: "{{ config_dir }}/api_token"
+        mode: "0600"
+
+    - name: Create the systemd user directory
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/.config/systemd/user"
+        state: directory
+        mode: "0755"
+
+    - name: Install the API service
+      ansible.builtin.template:
+        src: care-api.service.j2
+        dest: "{{ ansible_env.HOME }}/.config/systemd/user/{{ api_service }}.service"
+        mode: "0644"
+
+    - name: Start the API
+      ansible.builtin.systemd_service:
+        name: "{{ api_service }}"
+        scope: user
+        daemon_reload: true
+        state: restarted
+
+    - name: Wait for the API to answer /health
+      ansible.builtin.uri:
+        url: "http://{{ api_host }}:{{ api_port }}/health"
+      register: health
+      until: health.status == 200
+      retries: 40
+      delay: 3
+
+    - name: Done
+      ansible.builtin.debug:
+        msg:
+          - "care-bot is up at http://{{ api_host }}:{{ api_port }} ({{ api_workers }} workers, model {{ ollama_model }}, Postgres: {{ postgres_mode }})"
+          - "API token: {{ config_dir }}/api_token"
+          - "Logs: journalctl --user -u {{ api_service }} -f"
+          - "Try it: CARE_API_TOKEN=$(cat {{ config_dir }}/api_token) BASE_URL=http://{{ api_host }}:{{ api_port }} scripts/simulate.sh"

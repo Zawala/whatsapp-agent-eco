@@ -4,7 +4,8 @@
 #   export CARE_DATABASE_URL=postgresql://care:care@localhost:5433/care
 #   alembic upgrade head
 #
-# Port 5433 on the host so it doesn't clash with a local Postgres on 5432.
+# Port 5433 on the host so it doesn't clash with a local Postgres on 5432
+# (override with CARE_PG_PORT, e.g. so a CI stack can run beside a dev one).
 # Creates `care` (the app) and `care_test` (wiped by the tests).
 # Dev credentials only.
 services:
@@ -15,7 +16,7 @@ services:
       POSTGRES_PASSWORD: care
       POSTGRES_DB: care
     ports:
-      - "127.0.0.1:5433:5432"
+      - "127.0.0.1:${CARE_PG_PORT:-5433}:5432"
     volumes:
       # Postgres 18 images keep data under /var/lib/postgresql/18/docker.
       - pgdata:/var/lib/postgresql

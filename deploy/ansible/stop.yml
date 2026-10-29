@@ -1,0 +1,59 @@
+# Stop care-bot and its dependencies, in reverse order of start.yml:
+#   API -> Postgres -> Ollama
+#
+#   ansible-playbook -i deploy/ansible/inventory.ini deploy/ansible/stop.yml
+#   ... -e stop_ollama=false            # leave Ollama running
+#   ... -e postgres_mode=system -e stop_system_postgres=true
+#
+# Data is kept: the Docker volume isn't removed and nothing is dropped.
+- name: Stop care-bot
+  hosts: localhost
+  gather_facts: true
+  gather_subset: [min]
+  vars_files: [vars.yml]
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ lookup('pipe', 'id -u') }}"
+
+  tasks:
+    - name: Check whether the API service is installed
+      ansible.builtin.stat:
+        path: "{{ ansible_env.HOME }}/.config/systemd/user/{{ api_service }}.service"
+      register: api_unit
+
+    - name: Stop the API
+      ansible.builtin.systemd_service:
+        name: "{{ api_service }}"
+        scope: user
+        state: stopped
+      when: api_unit.stat.exists
+
+    - name: Stop Postgres (Docker)
+      ansible.builtin.command: docker compose stop
+      args:
+        chdir: "{{ repo_dir }}"
+      environment:
+        CARE_PG_PORT: "{{ postgres_port }}"
+      register: compose_stop
+      changed_when: "'Stopped' in compose_stop.stderr"
+      failed_when: false          # engine already down is fine
+      when: postgres_mode == 'docker'
+
+    - name: Stop the system Postgres
+      ansible.builtin.systemd_service:
+        name: postgresql
+        state: stopped
+      become: true
+      when: postgres_mode == 'system' and (stop_system_postgres | bool)
+
+    - name: Stop Ollama
+      ansible.builtin.systemd_service:
+        name: ollama
+        state: stopped
+      become: true
+      when: (stop_ollama | bool) and (manage_ollama | bool)
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          Stopped: API, Postgres ({{ postgres_mode }}{{ '' if postgres_mode == 'docker' or (stop_system_postgres | bool) else ', left running' }}),
+          Ollama{{ '' if (stop_ollama | bool) else ' (left running)' }}.

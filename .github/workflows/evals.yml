@@ -1,0 +1,97 @@
+# The full stack on a self-hosted runner that has Ollama:
+#   start.yml -> golden-set eval (gate) -> simulated traffic -> stop.yml
+#
+# Runner setup (once): see the "CI" section of the README. It needs the
+# self-hosted label `ollama`, Ollama running, the Docker engine, and lingering
+# enabled for the runner user (loginctl enable-linger) so systemctl --user works.
+#
+# Uses its own ports, service name and venv, so it can run beside a dev stack.
+name: Evals
+
+on:
+  pull_request:
+    paths:
+      - "care/**"
+      - "evals/**"
+      - "deploy/**"
+      - "migrations/**"
+      - "compose.yaml"
+      - "requirements.txt"
+      - ".github/workflows/evals.yml"
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * *"          # nightly, catches drift (e.g. a model re-pulled)
+  workflow_dispatch:
+    inputs:
+      min_routed_accuracy:
+        description: Fail below this routed accuracy
+        default: "0.95"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evals            # one model run at a time on the runner
+  cancel-in-progress: false
+
+env:
+  MIN_ROUTED_ACCURACY: ${{ inputs.min_routed_accuracy || '0.95' }}
+  CI_VENV: ${{ github.workspace }}/../care-bot-ci-venv   # outside the checkout, so it survives `git clean`
+  CI_CONFIG: ${{ github.workspace }}/../care-bot-ci-config
+  API_PORT: "8100"
+  PLAYBOOK_VARS: >-
+    -e manage_ollama=false
+    -e api_service=care-api-ci
+    -e api_port=8100
+    -e postgres_port=5434
+    -e install_deps=true
+
+jobs:
+  evals:
+    name: Start stack, eval, simulate, stop
+    # Self-hosted runners execute the PR's code on your machine: never for forks.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, ollama]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start the stack (start.yml)
+        run: >-
+          ansible-playbook -i deploy/ansible/inventory.ini deploy/ansible/start.yml
+          $PLAYBOOK_VARS -e venv="$CI_VENV" -e config_dir="$CI_CONFIG"
+
+      - name: Golden-set eval (fails below ${{ env.MIN_ROUTED_ACCURACY }} or on any high-risk miss)
+        run: |
+          "$CI_VENV/bin/python" -m evals.run --min-routed-accuracy "$MIN_ROUTED_ACCURACY" | tee eval-summary.txt
+          { echo '### Golden-set eval'; echo '```'; cat eval-summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Live tests (prompt injection x3)
+        run: '"$CI_VENV/bin/python" -m pytest -q tests/test_live.py'
+
+      - name: Simulated WhatsApp traffic against the API
+        run: |
+          CARE_API_TOKEN="$(cat "$CI_CONFIG/api_token")" BASE_URL="http://127.0.0.1:$API_PORT" \
+            scripts/simulate.sh | tee simulate.txt
+          grep -q "route=balance" simulate.txt    # the bot answered at least one message
+
+      - name: API logs on failure
+        if: failure()
+        run: journalctl --user -u care-api-ci --since "-30 min" --no-pager | tail -200
+
+      - name: Stop the stack (stop.yml)
+        if: always()
+        run: >-
+          ansible-playbook -i deploy/ansible/inventory.ini deploy/ansible/stop.yml
+          $PLAYBOOK_VARS -e venv="$CI_VENV" -e config_dir="$CI_CONFIG"
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: |
+            evals/results/
+            simulate.txt
+          if-no-files-found: ignore

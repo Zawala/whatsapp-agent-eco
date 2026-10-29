@@ -1,0 +1,33 @@
+# Settings for start.yml and stop.yml. Override any of them with -e name=value.
+
+repo_dir: "{{ playbook_dir | dirname | dirname }}"
+venv: "{{ repo_dir }}/.venv"
+config_dir: "{{ ansible_env.HOME }}/.config/care-bot"   # API token and env file (mode 0600)
+
+# Where Postgres comes from:
+#   docker - compose.yaml in the repo, port 5433 (needs the Docker engine)
+#   system - the machine's postgresql service, port 5432; the playbook creates
+#            the care role and databases if they're missing
+postgres_mode: docker
+postgres_password: care          # dev only; matches compose.yaml
+postgres_port: "{{ 5433 if postgres_mode == 'docker' else 5432 }}"   # docker: host port for compose.yaml
+database_url: "postgresql://care:{{ postgres_password }}@localhost:{{ postgres_port }}/care"
+
+# The model the bot uses, read from care/llm.py so the two can't drift apart.
+ollama_model: "{{ lookup('file', repo_dir + '/care/llm.py') | regex_search('MODEL = \"([^\"]+)\"', '\\1') | first }}"
+
+# true: start/stop the ollama system service (needs sudo).
+# false: expect Ollama to be running already, e.g. on a CI runner without sudo.
+manage_ollama: true
+
+api_service: care-api          # systemd user unit name; CI uses its own
+api_host: 127.0.0.1
+api_port: 8000
+# Each worker loads spaCy (~1 GB). Ollama answers one request at a time on CPU,
+# so more workers mostly queue; raise this once the model server is parallel.
+api_workers: 2
+
+# What stop.yml turns off. Ollama and the system Postgres may be shared with
+# other projects, so the system Postgres is left running unless asked.
+stop_ollama: true
+stop_system_postgres: false

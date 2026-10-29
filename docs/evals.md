@@ -11,6 +11,9 @@ python -m evals.compare --models llama3:8b mistral:latest  # just these
 
 Needs Ollama running (`ollama serve`) and the models pulled.
 
+CI runs the single-model gate (`python -m evals.run --min-routed-accuracy
+0.95`) on every relevant PR and nightly; see the CI section of the README.
+
 ## What it does
 
 ```mermaid

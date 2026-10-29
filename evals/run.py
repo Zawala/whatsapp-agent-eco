@@ -2,6 +2,10 @@
 
     python -m evals.run                      # record a run
     python -m evals.run --baseline FILE      # also compare with an earlier run
+    python -m evals.run --min-routed-accuracy 0.95   # exit 1 below this (CI gate)
+
+The gate also fails if high-risk recall is below 1.0: a high-risk message that
+reaches the model is never acceptable.
 
 The golden set is English only. Shona and Ndebele cases still need adding,
 written or reviewed by a native speaker; unreviewed translations don't count.
@@ -9,6 +13,7 @@ written or reviewed by a native speaker; unreviewed translations don't count.
 import argparse
 import json
 import statistics
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -74,6 +79,7 @@ def run() -> dict:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--baseline", type=Path)
+    ap.add_argument("--min-routed-accuracy", type=float, help="fail (exit 1) below this")
     args = ap.parse_args()
 
     res = run()
@@ -90,3 +96,13 @@ if __name__ == "__main__":
     for e in res["errors"]:
         print(f"  MISS want={e['want']:13} got={e['got']:13} {e['text']}")
     print(f"saved {path}")
+
+    if args.min_routed_accuracy is not None:
+        failures = []
+        if res["routed_accuracy"] < args.min_routed_accuracy:
+            failures.append(f"routed_accuracy {res['routed_accuracy']} < {args.min_routed_accuracy}")
+        if res["high_risk_recall"] < 1.0:
+            failures.append(f"high_risk_recall {res['high_risk_recall']} < 1.0")
+        for f in failures:
+            print(f"FAIL {f}")
+        sys.exit(1 if failures else 0)

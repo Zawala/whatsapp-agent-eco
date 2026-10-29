@@ -75,6 +75,8 @@ what each module does and how to change it, see
 | `care/state.py` | Conversation state (bot or agent) and message dedupe, in Postgres |
 | `migrations/` | Alembic migrations for the Postgres schema |
 | `compose.yaml` | Postgres for development and tests |
+| `deploy/ansible/` | Playbooks that start and stop the whole stack |
+| `.github/workflows/` | CI: tests and playbook checks on every push; full-stack evals on a self-hosted runner |
 | `demo.py` | Interactive chat in the terminal |
 | `scripts/simulate.sh` | Simulated WhatsApp traffic against the API |
 | `evals/` | Golden set and the classifier eval runner |
@@ -151,6 +153,38 @@ python demo.py --trace
 If Phoenix isn't running, `--trace` prints connection-refused export errors.
 The bot still works; the spans are just dropped.
 
+## Start and stop everything
+
+`deploy/ansible/start.yml` brings the whole stack up in order:
+
+1. creates the venv on first run;
+2. starts Ollama and pulls the model named in `care/llm.py` if it's missing;
+3. starts Postgres;
+4. runs the migrations;
+5. starts the API as the systemd user service `care-api`;
+6. waits for `/health`.
+
+`stop.yml` shuts it down in reverse order and keeps all data.
+
+```bash
+ansible-playbook -i deploy/ansible/inventory.ini deploy/ansible/start.yml
+ansible-playbook -i deploy/ansible/inventory.ini deploy/ansible/stop.yml
+```
+
+- Postgres comes from `compose.yaml` by default. Add `-e postgres_mode=system`
+  to use the machine's own Postgres; the playbook creates the `care` role and
+  the databases if they're missing.
+- `stop.yml` also stops Ollama; add `-e stop_ollama=false` to leave it running.
+  A system Postgres is left running unless you add `-e stop_system_postgres=true`.
+- The Ollama and system Postgres services need sudo. Add `-K` if sudo asks for a
+  password.
+- The API token is generated once and kept in `~/.config/care-bot/api_token`
+  (mode 0600). Logs: `journalctl --user -u care-api -f`.
+- The API is restarted on every `start.yml` run, so it picks up code changes.
+  Add `-e install_deps=true` to reinstall the requirements.
+
+Other settings (port, workers, password) are in `deploy/ansible/vars.yml`.
+
 ## Tests
 
 ```bash
@@ -193,6 +227,42 @@ warm-up call so load time isn't counted. To switch the bot to the winner, set
 `evals/routes.jsonl` uses the same format with extra phrasings for every route,
 including messages that look like high-risk requests but aren't. It's handy for
 manual checks in `demo.py`. The runner only reads `golden.jsonl` for now.
+
+## CI
+
+| Workflow | Runs on | When | What fails it |
+|---|---|---|---|
+| `.github/workflows/ci.yml` | GitHub-hosted | every push to `main` and every PR | a unit or Postgres test (against a Postgres service container); a playbook syntax or `ansible-lint` error; an invalid `compose.yaml` |
+| `.github/workflows/evals.yml` | self-hosted, label `ollama` | PRs touching `care/`, `evals/`, `deploy/`, migrations, compose or requirements; pushes to `main`; nightly at 02:00 UTC; manual | `start.yml` failing; routed accuracy below 0.95 or any high-risk miss; a live prompt-injection test; the API not answering simulated traffic; `stop.yml` failing |
+
+The evals job runs the real stack: `start.yml`, then the golden set with
+`--min-routed-accuracy`, then `tests/test_live.py`, then `scripts/simulate.sh`
+against the API, then `stop.yml` (which always runs). The scores go in the job
+summary and the results are uploaded as an artifact. It uses its own service
+name, ports (API 8100, Postgres 5434) and venv, so it can run on the same
+machine as a dev stack. It never runs for pull requests from forks, because a
+self-hosted runner would execute their code on your machine.
+
+The model evals need a self-hosted runner. GitHub's standard runners have no
+GPU, private-repo runners have too little memory for mistral-nemo's 7 GB, and
+the model would have to be downloaded on every run.
+
+**One-off setup for the self-hosted runner** (on the machine with Ollama):
+
+1. Install the Docker engine, Ansible (with the `community.docker` collection)
+   and Python 3.14, and have Ollama running with the model pulled.
+2. Add a runner under GitHub → repo Settings → Actions → Runners → New
+   self-hosted runner, and give it the extra label `ollama`.
+3. Run `sudo loginctl enable-linger <runner user>`, so the runner can use
+   `systemctl --user` without anyone logged in.
+4. Under Settings → Actions → General, require approval for workflows from
+   outside collaborators.
+
+If the runner is offline, evals jobs wait in the queue. GitHub cancels them
+after 24 hours.
+
+To change the bar, run the workflow by hand with a different
+`min_routed_accuracy`, or edit the default in `evals.yml`.
 
 ## Limitations
 
