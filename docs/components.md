@@ -13,6 +13,9 @@ lets the tests swap in a fake.
 flowchart TD
     demo["demo.py"] --> assistant
     demo -. "--trace" .-> tracing
+    api["care/api.py"] --> assistant
+    api --> state["care/state.py"]
+    state --> sqlite[("SQLite")]
     evals["evals/run.py"] --> router
     evals --> llm
 
@@ -237,6 +240,57 @@ loaded unless tracing is enabled.
 
 ---
 
+## `care/api.py` — HTTP API
+
+**Role:** what the WhatsApp integration calls. It wraps `handle()` with
+conversation state. Run it with
+`CARE_API_TOKEN=... uvicorn care.api:create_app --factory`.
+
+| Endpoint | What it does |
+|---|---|
+| `GET /health` | `{"ok": true}`. No auth. |
+| `POST /messages` | Body `{message_id, msisdn, area, text}`. Returns `{message_id, status, reply, route, handoff, blocked, duplicate}`. |
+| `GET /conversations/{msisdn}` | Status, handoff reason and the last 20 message outcomes. |
+| `POST /conversations/{msisdn}/release` | An agent is done; the bot answers again. |
+
+`POST /messages`, in order:
+
+1. If the `message_id` was seen before, return the stored outcome with
+   `duplicate: true`. WhatsApp redelivers messages, and this stops them being
+   handled twice.
+2. If an agent owns the conversation, record the message and return
+   `reply: null, route: "agent"`. The integration forwards it to the agent.
+3. Otherwise run `handle()`. If the reply is a handoff, the conversation moves
+   to `agent`, with the route and blocked reasons as the reason.
+
+Each customer's messages run one at a time, under a per-msisdn lock.
+
+- Every route except `/health` needs `Authorization: Bearer $CARE_API_TOKEN`.
+  The app won't start without the token set.
+- `msisdn` and `area` are trusted, so they must come from the WhatsApp layer,
+  never from message text. `msisdn` is 9–15 digits.
+- `text` is capped at 4096 characters, WhatsApp's own limit. Bad input gets a
+  422 before any model call.
+
+---
+
+## `care/state.py` — conversation state
+
+**Role:** who owns each conversation, and which messages were already handled.
+
+| Table | Columns |
+|---|---|
+| `conversations` | `msisdn` (key), `status` (`bot`/`agent`), `reason`, `updated_at` |
+| `messages` | `message_id` (key), `msisdn`, `received_at`, `route`, `handoff`, `blocked`, `reply` |
+
+Customer text is never stored, only decisions and the reply, which has
+already been redacted. `Store` is SQLite with one connection guarded by a lock,
+so it only works in a single process. For several workers, put the same
+interface on Postgres and swap the per-msisdn lock for a row lock (`SELECT …
+FOR UPDATE`) or per-customer ordering in a queue.
+
+---
+
 ## `demo.py` — terminal chat
 
 Reads lines from stdin, builds a fresh `Session` per message (fake number,
@@ -265,6 +319,7 @@ they never reach the model.
 | File | Needs | Covers |
 |---|---|---|
 | `test_core.py` | nothing (uses `FakeLLM`) | Redaction, tool gating and idempotency, price/policy/canary checks, retrieval cut and stale docs, classifier retry/fallback, high-risk regex vs golden labels, zero LLM calls on high-risk, every pipeline handoff path |
+| `test_api.py` | nothing (FakeLLM, temp SQLite) | Answers and status, redelivery dedupe, handoff gives the conversation to an agent and the bot stays quiet, release, state survives restart, no customer text stored, auth, input limits |
 | `test_live.py` | Ollama running | Prompt injection doesn't leak the canary, run 3 times (all must pass) |
 
 `FakeLLM` returns scripted replies in order and counts calls, so tests can

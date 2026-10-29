@@ -71,7 +71,10 @@ what each module does and how to change it, see
 | `care/tools.py` | Tool allowlist, session, fake backends |
 | `care/llm.py` | The only module that talks to Ollama |
 | `care/tracing.py` | Optional Phoenix tracing |
+| `care/api.py` | FastAPI app the WhatsApp integration calls |
+| `care/state.py` | Conversation state (bot or agent) and message dedupe, in SQLite |
 | `demo.py` | Interactive chat in the terminal |
+| `scripts/simulate.sh` | Simulated WhatsApp traffic against the API |
 | `evals/` | Golden set and the classifier eval runner |
 | `tests/` | Offline unit tests and live tests |
 | `docs/` | Architecture diagrams and component reference |
@@ -98,8 +101,29 @@ python demo.py
 ```
 
 Each reply shows its route, e.g. `[route=balance handoff=False blocked=[]]`.
-The demo session uses a fake number with a balance and the `harare-cbd` area,
-which has a planned-maintenance outage.
+
+Or run it as an API:
+
+```bash
+CARE_API_TOKEN=dev uvicorn care.api:create_app --factory --port 8000
+
+curl -X POST localhost:8000/messages -H 'Authorization: Bearer dev' \
+  -H 'content-type: application/json' \
+  -d '{"message_id":"wamid.1","msisdn":"263772000001","area":"harare-cbd","text":"What is my balance?"}'
+```
+
+Any handoff gives the conversation to a human agent. After that the bot stays
+quiet (`reply: null`) until `POST /conversations/{msisdn}/release`.
+A repeated `message_id` returns the stored result and isn't processed again.
+State lives in `care.db` (set `CARE_DB` to move it). See
+[docs/components.md](docs/components.md#careapipy--http-api) for the endpoints.
+
+With the API running, `scripts/simulate.sh` walks through every route, a
+redelivered message, a handoff, the bot staying quiet, and a release.
+`scripts/simulate.sh load 10` sends 10 bundle questions at once.
+
+The demo and the simulation use a fake number with a balance and the
+`harare-cbd` area, which has a planned-maintenance outage.
 
 With tracing, start Phoenix first, then open http://localhost:6006:
 
