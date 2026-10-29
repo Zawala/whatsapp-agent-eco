@@ -1,7 +1,8 @@
 # Architecture
 
 How a WhatsApp message turns into a reply, and where each guardrail sits.
-For a module-by-module reference see [components.md](components.md).
+For a module-by-module reference see [components.md](components.md); for the
+conversation state, see [data-model.md](data-model.md).
 
 > Diagrams are [Mermaid](https://mermaid.js.org/). GitHub renders them inline;
 > in an editor, use a Mermaid preview extension.
@@ -16,7 +17,9 @@ flowchart LR
     agent([Human care agent])
 
     subgraph local["Local machine"]
-        demo["demo.py<br/>(stands in for the WhatsApp channel)"]
+        demo["demo.py / scripts/simulate.sh<br/>(stand in for the WhatsApp channel)"]
+        api["care/api.py<br/>FastAPI · POST /messages"]
+        pg[("Postgres<br/>conversations · messages")]
         bot["care package<br/>assistant.handle()"]
         fakes[("Fake backends<br/>balances · outages · tickets")]
         kb[("knowledge.py<br/>bundles + FAQs")]
@@ -25,20 +28,29 @@ flowchart LR
     end
 
     user -- message --> demo
-    demo -- "text + Session" --> bot
+    demo -- "HTTP: message_id, msisdn, area, text" --> api
+    api -- "lock customer, claim message,<br/>owner (bot / agent)" --> pg
+    api -- "text + Session<br/>(only if the bot owns it)" --> bot
     bot -- "classify / answer<br/>(OpenAI-compatible API)" --> ollama
     bot -- tool calls --> fakes
     bot -- retrieval --> kb
     bot -. "spans (decisions only)" .-> phoenix
-    bot -- Reply --> demo
+    bot -- Reply --> api
+    api -- "reply, or null if an agent owns it" --> demo
     demo -- reply text --> user
-    bot -. "handoff=True" .-> agent
+    api -. "handoff: conversation -> agent" .-> agent
+    agent -. "pickup / release / close" .-> api
+    sweep["care/sweep.py<br/>(timer)"] -- "close idle" --> pg
 ```
 
-There is no WhatsApp integration yet. `demo.py` plays the channel's role: it
-builds the `Session` (phone number, area, message ID) that a real webhook would
-fill from WhatsApp metadata. The human-agent queue is also not built; a handoff
-is just `Reply.handoff = True`.
+There is no WhatsApp integration yet. `scripts/simulate.sh` (over the API) and
+`demo.py` (calling `handle()` directly, with no state) play the channel's role.
+They supply the phone number, area and message ID that a real webhook would
+fill from WhatsApp metadata.
+
+A handoff moves the conversation to `agent` in Postgres, and the bot stays
+quiet until an agent releases or closes it (see [§10](#10-conversation-lifecycle)). The agent desk itself
+isn't built: the endpoints exist, but nothing notifies an agent yet.
 
 ## 2. Message pipeline
 
@@ -235,18 +247,41 @@ calls are no-ops. Spans never contain message text or model output.
 
 ```mermaid
 flowchart LR
-    subgraph offline["pytest (offline)"]
+    subgraph offline["pytest, no model"]
         fake["FakeLLM<br/>scripted replies, counts calls"] --> core["tests/test_core.py<br/>every guardrail + pipeline path"]
+        fake --> tapi["tests/test_api.py<br/>API, state, several workers"]
+        tapi --> tpg[("Postgres<br/>CARE_TEST_DATABASE_URL")]
     end
     subgraph live["needs Ollama"]
         tl["tests/test_live.py<br/>prompt injection ×3, no canary leak"]
-        ev["evals/run.py<br/>classifier vs golden.jsonl"]
+        ev["evals/run.py<br/>classifier vs golden.jsonl<br/>--min-routed-accuracy gate"]
+        cmp["evals/compare.py<br/>every model: speed vs accuracy"]
     end
     golden[("evals/golden.jsonl")] --> ev
     golden --> core
+    cmp --> ev
     ev --> res[("evals/results/*.json")]
     res -. "--baseline" .-> ev
 ```
 
+CI runs these automatically:
+
+```mermaid
+flowchart LR
+    push(["push / PR"]) --> ci["ci.yml · GitHub-hosted<br/>test_core + test_api (Postgres service)<br/>playbook syntax + ansible-lint<br/>compose config"]
+    push -- "model-related paths,<br/>nightly, manual" --> evj
+    subgraph evj["evals.yml · self-hosted, label ollama"]
+        direction LR
+        s["start.yml"] --> g["evals.run<br/>≥ 0.95, no high-risk miss"] --> l["test_live.py"] --> sim["simulate.sh"] --> st["stop.yml<br/>(always)"]
+    end
+```
+
 `test_core.py` also checks the high-risk regex against the `high_risk` labels in
 `golden.jsonl`, so the regex and the eval labels can't drift apart.
+
+## 10. Conversation lifecycle
+
+Over the API, messages from one customer form a conversation that opens,
+continues within a window (24 h by default), and closes as `timeout`,
+`abandoned`, `resolved` or `agent_resolved`. The state diagram, close
+reasons, tables and locking are in [data model](data-model.md#lifecycle).

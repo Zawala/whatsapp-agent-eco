@@ -18,8 +18,8 @@
     # --- preflight -------------------------------------------------------------
     - name: Check postgres_mode
       ansible.builtin.assert:
-        that: postgres_mode in ['docker', 'system']
-        fail_msg: "postgres_mode must be docker or system, got {{ postgres_mode }}"
+        that: postgres_mode in ['docker', 'system', 'external']
+        fail_msg: "postgres_mode must be docker, system or external, got {{ postgres_mode }}"
 
     - name: Check the Docker engine is running
       when: postgres_mode == 'docker'
@@ -157,12 +157,25 @@
         dest: "{{ ansible_env.HOME }}/.config/systemd/user/{{ api_service }}.service"
         mode: "0644"
 
+    - name: Install the sweeper service and timer
+      ansible.builtin.template:
+        src: "care-sweep.{{ item }}.j2"
+        dest: "{{ ansible_env.HOME }}/.config/systemd/user/{{ api_service }}-sweep.{{ item }}"
+        mode: "0644"
+      loop: [service, timer]
+
     - name: Start the API
       ansible.builtin.systemd_service:
         name: "{{ api_service }}"
         scope: user
         daemon_reload: true
         state: restarted
+
+    - name: Start the sweeper timer
+      ansible.builtin.systemd_service:
+        name: "{{ api_service }}-sweep.timer"
+        scope: user
+        state: started
 
     - name: Wait for the API to answer /health
       ansible.builtin.uri:
@@ -177,5 +190,5 @@
         msg:
           - "care-bot is up at http://{{ api_host }}:{{ api_port }} ({{ api_workers }} workers, model {{ ollama_model }}, Postgres: {{ postgres_mode }})"
           - "API token: {{ config_dir }}/api_token"
-          - "Logs: journalctl --user -u {{ api_service }} -f"
+          - "Logs: journalctl --user -u {{ api_service }} -f (sweeper: -u {{ api_service }}-sweep)"
           - "Try it: CARE_API_TOKEN=$(cat {{ config_dir }}/api_token) BASE_URL=http://{{ api_host }}:{{ api_port }} scripts/simulate.sh"

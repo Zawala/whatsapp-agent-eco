@@ -1,7 +1,7 @@
 # The full stack on a self-hosted runner that has Ollama:
 #   start.yml -> golden-set eval (gate) -> simulated traffic -> stop.yml
 #
-# Runner setup (once): see the "CI" section of the README. It needs the
+# Runner setup (once): see docs/how-to/ci.md. It needs the
 # self-hosted label `ollama`, Ollama running, the Docker engine, and lingering
 # enabled for the runner user (loginctl enable-linger) so systemctl --user works.
 #

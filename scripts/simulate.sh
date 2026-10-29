@@ -4,7 +4,7 @@
 #   scripts/simulate.sh            # walk through every route and the state rules
 #   scripts/simulate.sh load 10    # 10 bundle questions at once from different numbers
 #
-# Start the API first (needs CARE_DATABASE_URL, see README):
+# Start the API first (needs CARE_DATABASE_URL, see docs/how-to/run-the-stack.md):
 #   CARE_API_TOKEN=dev uvicorn care.api:create_app --factory
 # Env: BASE_URL (default http://localhost:8000), CARE_API_TOKEN (default dev).
 # Needs curl and jq.
@@ -34,7 +34,7 @@ send() {
     read -r code secs <<<"$(tail -n1 <<<"$out")"
     out=$(sed '$d' <<<"$out")
     if [[ $code == 200 ]]; then
-        out=$(jq -r --arg s "$secs" '"  [\(.status) route=\(.route) handoff=\(.handoff) dup=\(.duplicate) blocked=\(.blocked) \($s)s]\n  \(.reply // "(no reply: agent owns the conversation)")"' <<<"$out")
+        out=$(jq -r --arg s "$secs" '"  [\(.status) conv=\(.conversation_id[:8]) route=\(.route) handoff=\(.handoff) dup=\(.duplicate) blocked=\(.blocked) \($s)s]\n  \(.reply // "(no reply: agent owns the conversation)")"' <<<"$out")
     else
         out="  HTTP $code ${secs}s: $(jq -r '.detail | if type == "array" then map(.msg) | join("; ") else . end' <<<"$out" 2>/dev/null || echo "$out")"
     fi
@@ -47,8 +47,15 @@ release() {
         | jq -r '"  [released: status=\(.status)]"'
 }
 
+# agent ACTION JSON -> what the agent desk would call: pickup or close
+agent() {
+    curl -s -X POST "$BASE_URL/conversations/$MSISDN/$1" -H "Authorization: Bearer $TOKEN" \
+        -H 'content-type: application/json' -d "$2" \
+        | jq -r --arg a "$1" '"  [agent \($a): status=\(.status) agent=\(.agent_id) close_reason=\(.close_reason)]"'
+}
+
 # Each section starts with the bot owning the conversation, so an earlier
-# handoff doesn't silence it.
+# handoff doesn't silence it. (A 409 here just means the bot already owns it.)
 section() {
     printf '\n== %s ==\n' "$1"
     curl -s -X POST "$BASE_URL/conversations/$MSISDN/release" -H "Authorization: Bearer $TOKEN" >/dev/null
@@ -77,7 +84,16 @@ scenario() {
 
     section "conversation state"
     curl -s "$BASE_URL/conversations/$MSISDN" -H "Authorization: Bearer $TOKEN" \
-        | jq '{status, reason, updated_at, last_messages: [.messages[:5][] | {message_id, route, handoff}]}'
+        | jq '{conversation_id, status, opened_at, handoff_reason, events: [.events[].type],
+               last_messages: [.messages[:5][] | {message_id, route, intent, latency_ms}]}'
+
+    section "agent picks up and closes; the next message opens a new conversation"
+    send "I want my money back"
+    agent pickup '{"agent_id": "agent-7"}'
+    agent close '{"reason": "agent_resolved"}'
+    send "What is my balance?"
+    curl -s "$BASE_URL/customers/$MSISDN/conversations" -H "Authorization: Bearer $TOKEN" \
+        | jq -r '.[:3][] | "  \(.conversation_id[:8]) \(.status) \(.close_reason // "-") opened \(.opened_at)"'
 
     section "rejected requests"
     TOKEN=wrong send "What is my balance?"

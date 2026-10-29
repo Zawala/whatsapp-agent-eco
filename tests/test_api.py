@@ -6,9 +6,12 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi.testclient import TestClient
 
+import psycopg
+
 from care import tools
 from care.api import create_app
-from care.state import AGENT, BOT, Store
+from care.state import AGENT, BOT, CLOSED, Store
+from conftest import migrate
 from test_core import FakeLLM, route_json
 
 TOKEN = "test-token"
@@ -44,7 +47,7 @@ def test_answer_and_status(make_client):
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == BOT and body["route"] == "balance" and "3.20" in body["reply"]
-    assert body["duplicate"] is False
+    assert body["duplicate"] is False and body["conversation_id"]
 
 
 def test_redelivered_message_is_not_processed_twice(make_client):
@@ -174,7 +177,7 @@ def test_release_waits_for_message_in_progress(db_url):
             with a.turn(MSISDN) as t:
                 t.claim("wamid.1")
                 time.sleep(0.4)                     # the model call
-                t.set_status(AGENT, "high_risk")
+                t.hand_off("high_risk")
 
         def release_during_it():
             time.sleep(0.1)
@@ -202,3 +205,211 @@ def test_crash_mid_message_releases_the_claim(db_url):
             assert t.claim("wamid.1") is None       # still new
     finally:
         store.close()
+
+
+# --- conversation lifecycle ------------------------------------------------------
+REFUND = "I want a refund"      # high-risk: hands off without calling the model
+
+
+def post(c, message_id, text="What is my balance?", msisdn=MSISDN):
+    r = c.post("/messages", json=msg(message_id, text, msisdn), headers=AUTH)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def age(db_url, hours=25):
+    """Make every open conversation look idle for `hours`."""
+    with psycopg.connect(db_url) as conn:
+        conn.execute("UPDATE conversations SET last_activity_at = now() - make_interval(hours => %s) "
+                     "WHERE status <> 'closed'", (hours,))
+
+
+def events(c, msisdn=MSISDN):
+    return [e["type"] for e in c.get(f"/conversations/{msisdn}", headers=AUTH).json()["events"]]
+
+
+def test_messages_continue_one_conversation(make_client):
+    c = make_client(FakeLLM(route_json("balance")))
+    a, b = post(c, "wamid.1"), post(c, "wamid.2")
+    assert a["conversation_id"] == b["conversation_id"]
+    assert len(c.get(f"/customers/{MSISDN}/conversations", headers=AUTH).json()) == 1
+
+
+def test_idle_conversation_times_out_and_a_new_one_opens(make_client, db_url):
+    c = make_client(FakeLLM(route_json("balance")))
+    first = post(c, "wamid.1")
+    age(db_url)
+    second = post(c, "wamid.2")
+    assert second["conversation_id"] != first["conversation_id"] and second["status"] == BOT
+    old, new = sorted(c.get(f"/customers/{MSISDN}/conversations", headers=AUTH).json(), key=lambda x: x["opened_at"])
+    assert (old["status"], old["close_reason"], new["status"]) == (CLOSED, "timeout", BOT)
+
+
+def test_unpicked_handoff_is_abandoned_and_bot_answers_new_conversation(make_client, db_url):
+    c = make_client(FakeLLM(route_json("balance")))
+    post(c, "wamid.1", REFUND)
+    age(db_url)
+    r = post(c, "wamid.2")
+    assert r["status"] == BOT and "3.20" in r["reply"]     # the old agent conversation no longer silences the bot
+    old = c.get(f"/customers/{MSISDN}/conversations", headers=AUTH).json()[-1]
+    assert old["close_reason"] == "abandoned"
+
+
+def test_picked_up_handoff_that_goes_idle_is_a_timeout(make_client, db_url):
+    c = make_client(FakeLLM())
+    post(c, "wamid.1", REFUND)
+    c.post(f"/conversations/{MSISDN}/pickup", json={"agent_id": "agent-7"}, headers=AUTH)
+    age(db_url)
+    store = Store(db_url)
+    try:
+        assert store.close_idle() == 1
+        assert store.conversation(MSISDN).close_reason == "timeout"
+    finally:
+        store.close()
+
+
+def test_pickup_records_agent_and_rejects_bot_conversations(make_client):
+    c = make_client(FakeLLM(route_json("balance")))
+    post(c, "wamid.1")
+    assert c.post(f"/conversations/{MSISDN}/pickup", json={"agent_id": "a1"}, headers=AUTH).status_code == 409
+    post(c, "wamid.2", REFUND)
+    r = c.post(f"/conversations/{MSISDN}/pickup", json={"agent_id": "a1"}, headers=AUTH).json()
+    assert r["agent_id"] == "a1" and r["picked_up_at"] and r["status"] == AGENT
+
+
+def test_agent_actions_without_open_conversation_are_404(make_client):
+    c = make_client(FakeLLM())
+    for path, body in [("pickup", {"agent_id": "a1"}), ("release", None), ("close", {"reason": "resolved"})]:
+        assert c.post(f"/conversations/{MSISDN}/{path}", json=body, headers=AUTH).status_code == 404
+    assert c.get(f"/conversations/{MSISDN}", headers=AUTH).status_code == 404
+
+
+def test_close_then_next_message_opens_new_conversation(make_client):
+    c = make_client(FakeLLM(route_json("balance")))
+    first = post(c, "wamid.1", REFUND)
+    closed = c.post(f"/conversations/{MSISDN}/close", json={"reason": "agent_resolved"}, headers=AUTH).json()
+    assert (closed["status"], closed["close_reason"]) == (CLOSED, "agent_resolved")
+    second = post(c, "wamid.2")
+    assert second["conversation_id"] != first["conversation_id"] and second["status"] == BOT
+
+
+def test_release_of_bot_conversation_is_409_and_logs_nothing(make_client):
+    c = make_client(FakeLLM(route_json("balance")))
+    post(c, "wamid.1")
+    assert c.post(f"/conversations/{MSISDN}/release", headers=AUTH).status_code == 409
+    assert events(c) == ["opened"]
+
+
+def test_close_rejects_system_reasons(make_client):
+    c = make_client(FakeLLM(route_json("balance")))
+    post(c, "wamid.1")
+    assert c.post(f"/conversations/{MSISDN}/close", json={"reason": "timeout"}, headers=AUTH).status_code == 422
+
+
+def test_event_log_follows_the_lifecycle(make_client):
+    c = make_client(FakeLLM(route_json("balance")))
+    post(c, "wamid.1")
+    post(c, "wamid.2", REFUND)
+    c.post(f"/conversations/{MSISDN}/pickup", json={"agent_id": "a1"}, headers=AUTH)
+    c.post(f"/conversations/{MSISDN}/release", headers=AUTH)
+    c.post(f"/conversations/{MSISDN}/close", json={"reason": "resolved"}, headers=AUTH)
+    assert events(c) == ["opened", "handoff", "picked_up", "released", "closed"]
+    view = c.get(f"/conversations/{MSISDN}", headers=AUTH).json()
+    assert view["events"][1]["payload"] == {"reason": "high_risk"}
+    assert view["events"][2]["payload"] == {"agent_id": "a1"}
+
+
+def test_second_handoff_needs_a_new_pickup(make_client):
+    c = make_client(FakeLLM(route_json("balance")))
+    post(c, "wamid.1", REFUND)
+    c.post(f"/conversations/{MSISDN}/pickup", json={"agent_id": "a1"}, headers=AUTH)
+    c.post(f"/conversations/{MSISDN}/release", headers=AUTH)
+    post(c, "wamid.2", REFUND)
+    view = c.get(f"/conversations/{MSISDN}", headers=AUTH).json()
+    assert view["status"] == AGENT and view["agent_id"] is None and view["picked_up_at"] is None
+
+
+def test_message_rows_hold_decisions(make_client, db_url):
+    c = make_client(FakeLLM(route_json("balance", conf=0.85)))
+    post(c, "wamid.1", "What is my balance? I'm Tendai")
+    m = c.get(f"/conversations/{MSISDN}", headers=AUTH).json()["messages"][0]
+    assert m["intent"] == "balance" and abs(m["confidence"] - 0.85) < 1e-6 and m["latency_ms"] >= 0
+    with psycopg.connect(db_url) as conn:
+        dump = str(conn.execute("SELECT m.*, e.* FROM messages m, events e").fetchall())
+    assert "Tendai" not in dump
+
+
+def test_customer_first_message_race_opens_one_conversation(make_client, db_url):
+    llm = SlowLLM()
+    a, b = make_client(llm), make_client(llm)
+    ra, rb = _parallel(lambda: post(a, "wamid.1"), lambda: post(b, "wamid.2"))
+    assert ra["conversation_id"] == rb["conversation_id"]
+    with psycopg.connect(db_url) as conn:
+        assert conn.execute("SELECT count(*) FROM conversations").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM customers").fetchone()[0] == 1
+
+
+def test_sweeper_closes_only_idle_and_waits_for_turns(db_url):
+    a, b = Store(db_url), Store(db_url)
+    try:
+        with a.turn(MSISDN) as t:
+            t.conversation
+        with a.turn("263772000002") as t:
+            t.conversation
+        age(db_url)
+        with a.turn("263772000003") as t:           # fresh
+            t.conversation
+
+        # A message arrives for an idle customer while the sweep runs: the turn
+        # rolls the conversation over itself, and the sweep must not double-close.
+        def slow_turn():
+            with b.turn(MSISDN) as t:
+                t.conversation
+                time.sleep(0.4)
+
+        def sweep_during_it():
+            time.sleep(0.1)
+            return a.close_idle()
+
+        _, closed = _parallel(slow_turn, sweep_during_it)
+        assert closed == 1                           # only 263772000002; MSISDN was handled by the turn
+        assert a.conversation("263772000003").status == BOT
+        assert a.conversation(MSISDN).status == BOT  # the new conversation the turn opened
+        assert a.conversation("263772000002").close_reason == "timeout"
+    finally:
+        a.close()
+        b.close()
+
+
+def test_migration_backfills_0001_data(db_url):
+    migrate(db_url, "0001", down=True)
+    try:
+        with psycopg.connect(db_url) as conn:
+            conn.execute("INSERT INTO conversations (msisdn, status, reason) VALUES "
+                         "('263772000001', 'agent', 'high_risk'), ('263772000002', 'bot', 'released')")
+            conn.execute("INSERT INTO messages (message_id, msisdn, route, handoff, blocked, reply) VALUES "
+                         "('wamid.1', '263772000001', 'high_risk', true, '[]', 'x'), "
+                         "('wamid.2', '263772000003', 'balance', false, '[]', 'y')")
+    finally:
+        migrate(db_url)
+    store = Store(db_url)
+    try:
+        one, two, three = (store.conversation(m) for m in ("263772000001", "263772000002", "263772000003"))
+        assert (one.status, one.handoff_reason) == (AGENT, "high_risk")
+        assert (two.status, two.handoff_reason) == (BOT, None)
+        assert three.status == BOT                   # had messages but no 0001 row
+        assert [o.message_id for o in store.messages(one.conversation_id)] == ["wamid.1"]
+        assert [e.type for e in store.events(one.conversation_id)] == ["opened"]
+    finally:
+        store.close()
+
+
+def test_migration_downgrade_keeps_open_conversations(make_client, db_url):
+    post(make_client(FakeLLM()), "wamid.1", REFUND)
+    migrate(db_url, "0001", down=True)
+    try:
+        with psycopg.connect(db_url) as conn:
+            assert conn.execute("SELECT msisdn, status, reason FROM conversations").fetchall() == \
+                [(MSISDN, AGENT, "high_risk")]
+    finally:
+        migrate(db_url)

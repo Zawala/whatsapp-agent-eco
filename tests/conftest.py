@@ -12,16 +12,20 @@ import pytest
 TEST_DB = os.environ.get("CARE_TEST_DATABASE_URL")
 
 
-@pytest.fixture(scope="session")
-def _migrated():
-    if not TEST_DB:
-        pytest.skip("set CARE_TEST_DATABASE_URL to run the Postgres tests")
+def migrate(url: str, revision: str = "head", down: bool = False) -> None:
     from alembic import command
     from alembic.config import Config
 
     cfg = Config("alembic.ini")
-    cfg.attributes["url"] = TEST_DB
-    command.upgrade(cfg, "head")
+    cfg.attributes["url"] = url
+    (command.downgrade if down else command.upgrade)(cfg, revision)
+
+
+@pytest.fixture(scope="session")
+def _migrated():
+    if not TEST_DB:
+        pytest.skip("set CARE_TEST_DATABASE_URL to run the Postgres tests")
+    migrate(TEST_DB)
     return TEST_DB
 
 
@@ -31,5 +35,5 @@ def db_url(_migrated):
     import psycopg
 
     with psycopg.connect(_migrated) as conn:
-        conn.execute("TRUNCATE conversations, messages")
+        conn.execute("TRUNCATE events, messages, conversations, customers")
     return _migrated

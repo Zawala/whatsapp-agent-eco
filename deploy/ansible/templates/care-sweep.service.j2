@@ -1,0 +1,9 @@
+# Managed by deploy/ansible/start.yml; edits are overwritten.
+[Unit]
+Description=care-bot: close idle conversations
+
+[Service]
+Type=oneshot
+WorkingDirectory={{ repo_dir }}
+EnvironmentFile={{ config_dir }}/env
+ExecStart={{ venv }}/bin/python -m care.sweep

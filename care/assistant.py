@@ -31,6 +31,8 @@ class Reply:
     route: str
     handoff: bool = False
     blocked: list[str] = field(default_factory=list)
+    intent: str | None = None          # classifier output; None if the model wasn't asked
+    confidence: float | None = None
 
 
 def _handoff(route: str, blocked: list[str] | None = None) -> Reply:
@@ -99,6 +101,12 @@ def _pipeline(text: str, session: Session, llm, span) -> Reply:
     span.set_attribute("intent", route["intent"])
     span.set_attribute("language", route["language"])
     span.set_attribute("confidence", route["confidence"])
+    reply = _dispatch(route, clean, session, llm, span)
+    reply.intent, reply.confidence = route["intent"], route["confidence"]
+    return reply
+
+
+def _dispatch(route: dict, clean: str, session: Session, llm, span) -> Reply:
     if route["confidence"] < router.CONF_MIN or route["intent"] in ("unknown", "other"):
         return _handoff(route["intent"])
     if route["intent"] == "balance":

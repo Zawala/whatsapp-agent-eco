@@ -20,11 +20,12 @@
         path: "{{ ansible_env.HOME }}/.config/systemd/user/{{ api_service }}.service"
       register: api_unit
 
-    - name: Stop the API
+    - name: Stop the API and the sweeper timer
       ansible.builtin.systemd_service:
-        name: "{{ api_service }}"
+        name: "{{ item }}"
         scope: user
         state: stopped
+      loop: ["{{ api_service }}-sweep.timer", "{{ api_service }}"]
       when: api_unit.stat.exists
 
     - name: Stop Postgres (Docker)
@@ -56,4 +57,4 @@
       ansible.builtin.debug:
         msg: >-
           Stopped: API, Postgres ({{ postgres_mode }}{{ '' if postgres_mode == 'docker' or (stop_system_postgres | bool) else ', left running' }}),
-          Ollama{{ '' if (stop_ollama | bool) else ' (left running)' }}.
+          Ollama{{ '' if (stop_ollama | bool) and (manage_ollama | bool) else ' (left running)' }}.

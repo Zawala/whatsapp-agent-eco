@@ -15,6 +15,7 @@ flowchart TD
     demo -. "--trace" .-> tracing
     api["care/api.py"] --> assistant
     api --> state["care/state.py"]
+    sweep["care/sweep.py"] --> state
     state --> pg[("Postgres")]
     evals["evals/run.py"] --> router
     evals --> llm
@@ -44,10 +45,11 @@ imports. They're pure and testable on their own.
 | Name | What it is |
 |---|---|
 | `handle(text, session, llm=llm.chat) -> Reply` | Public entry point. Opens the `handle` span, runs the pipeline, turns any exception into a handoff, redacts output, records decision attributes. |
-| `Reply` | Dataclass: `text`, `route`, `handoff`, `blocked` (list of reason strings). |
+| `Reply` | Dataclass: `text`, `route`, `handoff`, `blocked` (list of reason strings), plus `intent` and `confidence` from the classifier (`None` if the model wasn't asked). |
 | `HANDOFF_TEXT` | The one message a customer sees on any handoff. |
 | `SYSTEM` | System prompt for bundle answers. Contains the canary from `checks.CANARY`. |
-| `_pipeline` | redact → high-risk → classify → confidence gate → dispatch. |
+| `_pipeline` | redact → high-risk → classify, then `_dispatch`. |
+| `_dispatch` | Confidence gate and `other`/`unknown` handoff, then picks the route handler by intent (`bundle_info` is the fallthrough). |
 | `_balance`, `_outage`, `_fault` | Call one tool each and fill a fixed template. No model involved. |
 | `_bundle` | Retrieve → answer with the model → run output checks. |
 
@@ -87,8 +89,7 @@ imports. They're pure and testable on their own.
 
 **To change:** add a high-risk phrase → edit `HIGH_RISK`, add a labelled case
 to `evals/golden.jsonl` (`test_high_risk_regex_matches_golden_labels` will
-check it). Add an intent → `INTENTS`, the `SYSTEM` prompt, a handler in
-`assistant._pipeline`, and golden cases.
+check it). Add an intent → [add an intent](../how-to/add-an-intent.md).
 
 ---
 
@@ -133,7 +134,8 @@ check it). Add an intent → `INTENTS`, the `SYSTEM` prompt, a handler in
 
 **To change a price:** add a new doc with a new `effective_from` and set
 `expires` on the old one, rather than editing the price in place. That keeps
-the history and lets you schedule changes.
+the history and lets you schedule changes. See
+[change bundles](../how-to/change-bundles.md).
 
 ---
 
@@ -221,11 +223,12 @@ output before the customer sees it.
 
 | Name | What it is |
 |---|---|
-| `MODEL` | `mistral-nemo:latest`, chosen by the 2026-10-29 comparison ([evals.md](evals.md#results-2026-10-29)) |
+| `MODEL` | `mistral-nemo:latest`, chosen by the 2026-10-29 comparison ([decision 0002](../decisions/0002-local-model-mistral-nemo.md)) |
 | `chat(messages, json_mode=False) -> str` | OpenAI-compatible call to `localhost:11434/v1`, temperature 0, 60s timeout. `json_mode` sets `response_format=json_object`. |
 
 To change model or provider, edit this file only. Anything with the same
-`chat(messages, json_mode=...) -> str` signature will work.
+`chat(messages, json_mode=...) -> str` signature will work. See
+[change the model](../how-to/change-the-model.md).
 
 ---
 
@@ -242,72 +245,44 @@ loaded unless tracing is enabled.
 
 ## `care/api.py` — HTTP API
 
-**Role:** what the WhatsApp integration calls. It wraps `handle()` with
-conversation state. Run it with
-`CARE_API_TOKEN=... CARE_DATABASE_URL=... uvicorn care.api:create_app --factory`.
-The app won't start without both set.
+**Role:** what the WhatsApp integration and the agent desk call. It wraps
+`handle()` with conversation state: `post_message` runs inside `Store.turn`,
+skips the bot when an agent owns the conversation, and records each outcome.
 
-| Endpoint | What it does |
+| Name | What it is |
 |---|---|
-| `GET /health` | `{"ok": true}`. No auth. |
-| `POST /messages` | Body `{message_id, msisdn, area, text}`. Returns `{message_id, status, reply, route, handoff, blocked, duplicate}`. |
-| `GET /conversations/{msisdn}` | Status, handoff reason and the last 20 message outcomes. |
-| `POST /conversations/{msisdn}/release` | An agent is done; the bot answers again. |
+| `create_app(token=None, store=None, llm=None)` | App factory (`uvicorn care.api:create_app --factory`). Reads `CARE_API_TOKEN` and, through `store_from_env`, `CARE_DATABASE_URL`. Tests pass a `Store` and a fake `llm`. |
+| `InboundMessage`, `MessageResult`, `Pickup`, `Close` | Request and response models; input limits live here. |
+| `auth` | Constant-time bearer-token check on every route except `/health`. |
 
-`POST /messages`, in order:
-
-1. If the `message_id` was seen before, return the stored outcome with
-   `duplicate: true`. WhatsApp redelivers messages, and this stops them being
-   handled twice.
-2. If an agent owns the conversation, record the message and return
-   `reply: null, route: "agent"`. The integration forwards it to the agent.
-3. Otherwise run `handle()`. If the reply is a handoff, the conversation moves
-   to `agent`, with the route and blocked reasons as the reason.
-
-All of this happens in one database transaction per message (`Store.turn`),
-so it's safe with any number of workers. See `care/state.py` below.
-
-- Every route except `/health` needs `Authorization: Bearer $CARE_API_TOKEN`.
-- `msisdn` and `area` are trusted, so they must come from the WhatsApp layer,
-  never from message text. `msisdn` is 9–15 digits.
-- `text` is capped at 4096 characters, WhatsApp's own limit. Bad input gets a
-  422 before any model call.
+Every endpoint, shape and status code is in [api.md](api.md).
 
 ---
 
 ## `care/state.py` — conversation state
 
-**Role:** who owns each conversation, and which messages were already handled.
+**Role:** customers, their conversations, message outcomes, and an event log
+for churn analysis, in Postgres.
 
-| Table | Columns |
+| Name | What it is |
 |---|---|
-| `conversations` | `msisdn` (key), `status` (`bot`/`agent`), `reason`, `updated_at` |
-| `messages` | `message_id` (key), `msisdn`, `received_at`, `route`, `handoff`, `blocked`, `reply` |
+| `Store(url, max_size=10, window=24h)` | Connection pool plus every operation. `turn(msisdn)` is the per-message transaction; `pickup`, `release`, `close_conversation`, `close_idle`; reads `conversation`, `conversations`, `messages`, `events`. |
+| `Turn` | One message inside the lock: `claim`, `conversation` (opened lazily), `hand_off`, `finish`, `status_of`. |
+| `Conversation`, `Outcome`, `Event` | Row dataclasses. |
+| `NotFound`, `Conflict` | Raised by agent actions; the API maps them to 404 and 409. |
+| `store_from_env()` | `Store` from `CARE_DATABASE_URL` and `CARE_CONVERSATION_WINDOW_HOURS`. |
 
-Customer text is never stored, only decisions and the reply, which has
-already been redacted. The schema is in `migrations/` (`alembic upgrade head`).
+Tables, the lifecycle, and the locking design are in
+[data-model.md](data-model.md).
 
-**Concurrency.** Each inbound message gets one transaction (`Store.turn`) that:
+---
 
-1. takes `pg_advisory_xact_lock` on the msisdn. One customer's messages run one
-   at a time across every worker, while different customers don't wait on each
-   other;
-2. claims the message by inserting its `message_id` first (`ON CONFLICT DO
-   NOTHING`). If the row already exists, it's a redelivery and the stored
-   outcome is returned. Two workers racing on the same message can't both
-   process it, because the second insert waits on the first and then conflicts;
-3. runs the bot and writes the outcome, then commits, which releases the lock.
+## `care/sweep.py` — close idle conversations
 
-If a worker dies mid-message, the transaction rolls back along with the claim,
-so WhatsApp's redelivery is processed from scratch. `release` takes the same
-lock, so it can't land mid-message and then be overwritten by that message's
-handoff.
-
-The lock is held through the model call, so each in-flight message holds one
-pooled connection. `Store(url, max_size=10)` caps in-flight messages per
-worker; keep `workers × max_size` under Postgres's `max_connections`.
-Per-customer ordering through a queue (Kafka keyed by msisdn) removes that cost
-later, without changing the schema.
+`python -m care.sweep` calls `Store.close_idle()` once and prints how many
+conversations it closed. `start.yml` installs a systemd user timer that runs
+it every 15 minutes. It imports only `care.state`, so it doesn't load the model
+pipeline.
 
 ---
 
@@ -326,11 +301,82 @@ flushes spans on exit.
 |---|---|
 | `golden.jsonl` | Labelled messages: `text`, `intent`, `high_risk`. Scored by the runner and used by `test_core.py`. |
 | `routes.jsonl` | Extra phrasings per route, including look-alikes of high-risk requests. Manual testing only for now. |
-| `run.py` | Runs the high-risk regex and real classifier over `golden.jsonl`. Reports intent accuracy (overall and per intent), routed accuracy, high-risk recall and precision, fallback rate, per-message latency, and every miss. Saves to `evals/results/<timestamp>.json`; `--baseline FILE` prints deltas. |
+| `run.py` | Runs the high-risk regex and real classifier over `golden.jsonl`. Reports intent accuracy (overall and per intent), routed accuracy, high-risk recall and precision, fallback rate, per-message latency, and every miss. Saves to `evals/results/<timestamp>.json`; `--baseline FILE` prints deltas. `--min-routed-accuracy X` exits 1 if routed accuracy is below X or high-risk recall is below 1.0 (the CI gate). |
 | `compare.py` | Runs `run.py` once per Ollama model and builds a speed-vs-accuracy matrix, Pareto front and scatter. Inputs, metrics and outputs are in [evals.md](evals.md). |
 
 High-risk cases are scored on the regex only, mirroring the pipeline, where
 they never reach the model.
+
+---
+
+## `migrations/` — database schema
+
+Alembic, with plain-SQL migrations; the URL comes from `CARE_DATABASE_URL`
+(`migrations/env.py`). Every schema change is a new numbered file with
+`upgrade()` and `downgrade()`, and `alembic upgrade head` applies whatever a
+database is missing. Alembic records each database's revision in its
+`alembic_version` table. That way a laptop, CI and production can each be at
+a different point and still get exactly the changes they lack, without
+dropping data. `start.yml` and the Postgres tests both run it. What each
+revision does is listed in [data model](data-model.md#migrations); how to add
+one is in [add a migration](../how-to/add-a-migration.md).
+
+---
+
+## `compose.yaml` — Postgres for development
+
+`postgres:18-alpine` on `127.0.0.1:5433`. Override the host port with
+`CARE_PG_PORT`; CI uses 5434 so it can run beside a dev stack. It creates the
+`care` database, and `docker/postgres/01-test-db.sql` creates `care_test` the
+first time the volume is made. Data is kept in the `pgdata` volume. The
+credentials (`care`/`care`) are for development only.
+
+---
+
+## `deploy/ansible/` — start and stop the stack
+
+| File | What it is |
+|---|---|
+| `start.yml` | venv (first run, or `install_deps=true`) → Ollama and the model from `care/llm.py` → Postgres (`postgres_mode=docker`, `system`, or `external` with your own `database_url`) → `alembic upgrade head` → token and env file in `~/.config/care-bot/` (0600) → systemd user services for the API and the sweeper timer → waits for `/health`. Safe to rerun; the API is always restarted. |
+| `stop.yml` | Stops the sweeper timer and the API, then Postgres, then Ollama. Keeps all data. A system or external Postgres is left running (a system one stops with `stop_system_postgres=true`). |
+| `vars.yml` | Every setting: paths, Postgres mode and port, workers, `manage_ollama`, `api_service`, `conversation_window_hours`, `sweep_interval`, what to stop. Override any of them with `-e`. |
+| `templates/` | The API unit, the sweeper service and timer (`<api_service>-sweep`), and the env file. |
+| `inventory.ini` | Localhost only. |
+
+`manage_ollama=false` skips the sudo-only Ollama service tasks; that's how CI
+runs. Both playbooks pass `ansible-lint --profile production`.
+
+---
+
+## `scripts/simulate.sh` — simulated WhatsApp traffic
+
+Bash, curl and jq. The default mode walks through:
+
+- one message per route;
+- a redelivered message;
+- a high-risk handoff, after which the bot stays quiet;
+- a release, after which the bot answers again;
+- the conversation view, with its events and per-message intent and latency;
+- an agent pickup and close, after which the next message opens a new
+  conversation;
+- rejected requests (bad token, text too long, bad msisdn).
+
+Each line shows the conversation the message landed in. Each section starts by
+releasing the conversation (a 409 there means the bot already owned it).
+`load N` sends N bundle questions at once from different numbers. Set `BASE_URL` and `CARE_API_TOKEN`
+to point it elsewhere.
+
+---
+
+## `.github/` — CI
+
+| File | What it is |
+|---|---|
+| `workflows/ci.yml` | GitHub-hosted, on every push to `main` and every PR: `test_core.py` and `test_api.py` against a Postgres service container, a playbook syntax check plus `ansible-lint`, and `docker compose config`. |
+| `workflows/evals.yml` | Self-hosted runner labelled `ollama`, on model-related PRs, pushes to `main`, nightly and on demand. Runs `start.yml`, the eval gate, `test_live.py`, `simulate.sh`, then `stop.yml` (always). Uploads the results. Never runs for forks. |
+| `actionlint.yaml` | Declares the `ollama` runner label for `actionlint`. |
+
+Runner setup is in [CI](../how-to/ci.md).
 
 ---
 
@@ -339,7 +385,8 @@ they never reach the model.
 | File | Needs | Covers |
 |---|---|---|
 | `test_core.py` | nothing (uses `FakeLLM`) | Redaction, tool gating and idempotency, price/policy/canary checks, retrieval cut and stale docs, classifier retry/fallback, high-risk regex vs golden labels, zero LLM calls on high-risk, every pipeline handoff path |
-| `test_api.py` | `CARE_TEST_DATABASE_URL` (skipped without it; the tests wipe it) | Answers and status, redelivery dedupe, handoff gives the conversation to an agent and the bot stays quiet, release, state survives restart, no customer text stored, auth, input limits. Across workers: one customer is handled one message at a time, different customers run in parallel, a raced message is processed once, release waits for a message in progress, a crash releases the claim |
+| `test_api.py` | `CARE_TEST_DATABASE_URL` (skipped without it; the tests wipe it) | Answers and status, redelivery dedupe, handoff gives the conversation to an agent and the bot stays quiet, release, state survives restart, no customer text stored, auth, input limits. Across workers: one customer is handled one message at a time, different customers run in parallel, a raced message is processed once, release waits for a message in progress, a crash releases the claim. Lifecycle: messages continue one conversation; idle ones close as `timeout` or `abandoned`; pickup, release and close (with their 404s and 409s); the event sequence; a second handoff needs a new pickup; a first-message race opens one conversation; the sweeper closes only idle conversations and doesn't race a turn; migration 0002 backfills 0001 data and downgrades |
+| `conftest.py` | — | The `db_url` fixture: runs the migrations once against `CARE_TEST_DATABASE_URL`, then truncates the tables before each test. Without the variable, those tests are skipped. `migrate()` steps the schema up or down for the migration tests. |
 | `test_live.py` | Ollama running | Prompt injection doesn't leak the canary, run 3 times (all must pass) |
 
 `FakeLLM` returns scripted replies in order and counts calls, so tests can

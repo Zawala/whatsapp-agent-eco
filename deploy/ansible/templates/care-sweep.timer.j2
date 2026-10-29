@@ -1,0 +1,10 @@
+# Managed by deploy/ansible/start.yml; edits are overwritten.
+[Unit]
+Description=care-bot: close idle conversations every {{ sweep_interval }}
+
+[Timer]
+OnActiveSec=1min
+OnUnitActiveSec={{ sweep_interval }}
+
+[Install]
+WantedBy=timers.target
