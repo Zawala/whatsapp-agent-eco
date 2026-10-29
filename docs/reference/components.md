@@ -234,7 +234,9 @@ To change model or provider, edit this file only. Anything with the same
 
 ## `care/tracing.py` — optional tracing
 
-**Role:** sends OpenTelemetry spans to Phoenix when switched on.
+**Role:** sends OpenTelemetry spans to Phoenix when switched on. The client
+(`arize-phoenix-otel`) is in `requirements.txt`; the Phoenix server/UI is a
+separate `pip install arize-phoenix`.
 
 `enable(project="care-bot", endpoint="http://localhost:6006/v1/traces")`
 registers a Phoenix tracer provider and instruments the OpenAI client with

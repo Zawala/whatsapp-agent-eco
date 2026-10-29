@@ -35,7 +35,7 @@ Status as of 2026-10-29.
 |---|---|---|---|
 | 12 | Abuse limits | 🟡 | Text is capped at 4096 characters. There's no per-number rate limit yet. |
 | 13 | Monitoring | 🟡 | Decision traces (Phoenix) and the nightly eval. No production trace backend, metrics or alerts yet (handoff rate, blocked reasons, latency, errors). |
-| 14 | Packaging | 🟡 | Ansible start/stop, Compose, systemd units, migrations and CI exist. `requirements.txt` is still a full freeze with unused packages. `MODEL` and the Ollama URL are hard-coded. No container image or load test yet. |
+| 14 | Packaging | 🟡 | Ansible start/stop, Compose, systemd units, migrations and CI exist. `requirements.txt` lists only direct dependencies (it was a 255-package freeze whose pins conflicted on a fresh install). There's no lock file yet for fully repeatable installs, e.g. with `pip-compile`. `MODEL` and the Ollama URL are hard-coded. No container image or load test yet. |
 | 15 | Privacy and compliance | 🟡 | No customer text is stored ([0005](decisions/0005-no-customer-text-stored.md)). Still needed: telling customers it's a bot, retention periods, data residency, a legal review against the Data Protection Act, and a security review of the balance route, which trusts the WhatsApp number as identity. |
 
 ## Known bugs

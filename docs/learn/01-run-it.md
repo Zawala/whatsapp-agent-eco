@@ -54,6 +54,7 @@ The demo uses a fake number with a balance (`263772000001`) and the area
 ## Step 2: watch the decisions in traces (optional)
 
 ```bash
+pip install arize-phoenix  # once: the trace UI isn't in requirements.txt
 phoenix serve              # in another terminal, then open http://localhost:6006
 python demo.py --trace
 ```

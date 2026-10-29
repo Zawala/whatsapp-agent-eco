@@ -49,7 +49,8 @@ message to `evals/golden.jsonl` if the classifier got it wrong.
 
 ## 4. Traces
 
-`python demo.py --trace` with `phoenix serve` running records each decision:
+`python demo.py --trace` with `phoenix serve` running (install it with `pip install
+arize-phoenix`) records each decision:
 intent, language, confidence, `retrieval.doc_ids`, route, blocked, and
 exceptions. Message text and model output are deliberately not recorded, so
 traces tell you *what* was decided, and steps 1–3 tell you *why*.
