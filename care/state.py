@@ -1,42 +1,35 @@
-"""Conversation state: who owns each conversation, and which messages are already handled.
+"""Conversation state in Postgres: who owns each conversation, and which messages are handled.
 
 A conversation is keyed by msisdn and is either "bot" (the assistant replies) or
 "agent" (a person has it; the assistant stays quiet until it's released).
 Every handoff moves it to "agent".
 
-Each message ID is stored once with its outcome, so a redelivered WhatsApp
-message gets the same reply and is never processed twice. Customer text is not
-stored, only decisions and the (already redacted) reply.
+Each inbound message is handled in one transaction (`Store.turn`) that:
+  - holds a Postgres advisory lock on the msisdn, so one customer's messages run
+    one at a time across every worker, while different customers run in parallel
+  - claims the message ID by inserting it first; if the row already exists the
+    message is a redelivery and the stored outcome is returned instead
 
-SQLite, one process. For several workers, move this to Postgres; the interface
-stays the same.
+If the worker dies mid-message the transaction rolls back, the claim goes with
+it, and WhatsApp's redelivery is handled from scratch. The lock is held through
+the model call, so each in-flight message uses one pooled connection.
+
+Customer text is not stored, only decisions and the (already redacted) reply.
+Schema lives in migrations/ (`alembic upgrade head`).
 """
-import json
-import sqlite3
-import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
+
+from psycopg.rows import class_row
+from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool
 
 BOT, AGENT = "bot", "agent"
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS conversations (
-    msisdn     TEXT PRIMARY KEY,
-    status     TEXT NOT NULL CHECK (status IN ('bot', 'agent')),
-    reason     TEXT,
-    updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS messages (
-    message_id  TEXT PRIMARY KEY,
-    msisdn      TEXT NOT NULL,
-    received_at TEXT NOT NULL,
-    route       TEXT NOT NULL,
-    handoff     INTEGER NOT NULL,
-    blocked     TEXT NOT NULL,
-    reply       TEXT
-);
-CREATE INDEX IF NOT EXISTS messages_msisdn ON messages (msisdn, received_at);
-"""
+# Same key space for every caller of the lock; hashtextextended gives a bigint.
+_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))"
 
 
 @dataclass
@@ -44,7 +37,7 @@ class Conversation:
     msisdn: str
     status: str
     reason: str | None
-    updated_at: str
+    updated_at: datetime | None
 
 
 @dataclass
@@ -57,51 +50,74 @@ class Outcome:
     reply: str | None      # None when an agent owns the conversation
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+_OUTCOME = "SELECT message_id, msisdn, route, handoff, blocked, reply FROM messages"
+
+
+class Turn:
+    """One customer's message, inside the transaction that holds their lock."""
+
+    def __init__(self, conn, msisdn: str):
+        self._conn, self.msisdn = conn, msisdn
+
+    def claim(self, message_id: str) -> Outcome | None:
+        """Claim the message. Returns None if it's new, or the stored outcome if it was handled before."""
+        row = self._conn.execute("INSERT INTO messages (message_id, msisdn) VALUES (%s, %s) "
+                                 "ON CONFLICT (message_id) DO NOTHING RETURNING message_id",
+                                 (message_id, self.msisdn)).fetchone()
+        if row:
+            return None
+        with self._conn.cursor(row_factory=class_row(Outcome)) as cur:
+            return cur.execute(f"{_OUTCOME} WHERE message_id = %s", (message_id,)).fetchone()
+
+    def status(self) -> str:
+        return _conversation(self._conn, self.msisdn).status
+
+    def set_status(self, status: str, reason: str | None = None) -> None:
+        _set_status(self._conn, self.msisdn, status, reason)
+
+    def finish(self, o: Outcome) -> None:
+        self._conn.execute("UPDATE messages SET route = %s, handoff = %s, blocked = %s, reply = %s "
+                           "WHERE message_id = %s", (o.route, o.handoff, Jsonb(o.blocked), o.reply, o.message_id))
 
 
 class Store:
-    def __init__(self, path: str = "care.db"):
-        self._db = sqlite3.connect(path, check_same_thread=False)
-        self._db.executescript(_SCHEMA)
-        self._lock = threading.Lock()          # one connection shared by the API's threads
-        self._conv_locks: dict[str, threading.Lock] = {}
+    def __init__(self, url: str, max_size: int = 10):
+        # max_size caps how many messages can be in flight at once (one connection each).
+        self._pool = ConnectionPool(url, min_size=1, max_size=max_size, open=True)
 
-    def conversation_lock(self, msisdn: str) -> threading.Lock:
-        """Held while one message is handled, so a customer's messages run one at a time."""
-        with self._lock:
-            return self._conv_locks.setdefault(msisdn, threading.Lock())
+    def close(self) -> None:
+        self._pool.close()
+
+    @contextmanager
+    def turn(self, msisdn: str) -> Iterator[Turn]:
+        with self._pool.connection() as conn, conn.transaction():
+            conn.execute(_LOCK, (msisdn,))
+            yield Turn(conn, msisdn)
 
     def conversation(self, msisdn: str) -> Conversation:
-        with self._lock:
-            row = self._db.execute("SELECT msisdn, status, reason, updated_at FROM conversations WHERE msisdn = ?",
-                                   (msisdn,)).fetchone()
-        return Conversation(*row) if row else Conversation(msisdn, BOT, None, _now())
+        with self._pool.connection() as conn:
+            return _conversation(conn, msisdn)
 
-    def set_status(self, msisdn: str, status: str, reason: str | None = None) -> None:
-        with self._lock, self._db:
-            self._db.execute(
-                "INSERT INTO conversations (msisdn, status, reason, updated_at) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT (msisdn) DO UPDATE SET status = excluded.status, reason = excluded.reason, "
-                "updated_at = excluded.updated_at",
-                (msisdn, status, reason, _now()))
-
-    def outcome(self, message_id: str) -> Outcome | None:
-        with self._lock:
-            row = self._db.execute("SELECT message_id, msisdn, route, handoff, blocked, reply FROM messages "
-                                   "WHERE message_id = ?", (message_id,)).fetchone()
-        if not row:
-            return None
-        return Outcome(row[0], row[1], row[2], bool(row[3]), json.loads(row[4]), row[5])
-
-    def record(self, o: Outcome) -> None:
-        with self._lock, self._db:
-            self._db.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
-                             (o.message_id, o.msisdn, _now(), o.route, int(o.handoff), json.dumps(o.blocked), o.reply))
+    def release(self, msisdn: str) -> Conversation:
+        """Give the conversation back to the bot. Waits for any message in progress."""
+        with self.turn(msisdn) as t:
+            t.set_status(BOT, "released")
+            return _conversation(t._conn, msisdn)
 
     def history(self, msisdn: str, limit: int = 20) -> list[Outcome]:
-        with self._lock:
-            rows = self._db.execute("SELECT message_id, msisdn, route, handoff, blocked, reply FROM messages "
-                                    "WHERE msisdn = ? ORDER BY received_at DESC LIMIT ?", (msisdn, limit)).fetchall()
-        return [Outcome(r[0], r[1], r[2], bool(r[3]), json.loads(r[4]), r[5]) for r in rows]
+        with self._pool.connection() as conn, conn.cursor(row_factory=class_row(Outcome)) as cur:
+            return cur.execute(f"{_OUTCOME} WHERE msisdn = %s AND route IS NOT NULL "
+                               "ORDER BY received_at DESC LIMIT %s", (msisdn, limit)).fetchall()
+
+
+def _conversation(conn, msisdn: str) -> Conversation:
+    with conn.cursor(row_factory=class_row(Conversation)) as cur:
+        row = cur.execute("SELECT msisdn, status, reason, updated_at FROM conversations WHERE msisdn = %s",
+                          (msisdn,)).fetchone()
+    return row or Conversation(msisdn, BOT, None, None)
+
+
+def _set_status(conn, msisdn: str, status: str, reason: str | None) -> None:
+    conn.execute("INSERT INTO conversations (msisdn, status, reason) VALUES (%s, %s, %s) "
+                 "ON CONFLICT (msisdn) DO UPDATE SET status = excluded.status, reason = excluded.reason, "
+                 "updated_at = now()", (msisdn, status, reason))

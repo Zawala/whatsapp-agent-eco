@@ -15,7 +15,7 @@ flowchart TD
     demo -. "--trace" .-> tracing
     api["care/api.py"] --> assistant
     api --> state["care/state.py"]
-    state --> sqlite[("SQLite")]
+    state --> pg[("Postgres")]
     evals["evals/run.py"] --> router
     evals --> llm
 
@@ -244,7 +244,8 @@ loaded unless tracing is enabled.
 
 **Role:** what the WhatsApp integration calls. It wraps `handle()` with
 conversation state. Run it with
-`CARE_API_TOKEN=... uvicorn care.api:create_app --factory`.
+`CARE_API_TOKEN=... CARE_DATABASE_URL=... uvicorn care.api:create_app --factory`.
+The app won't start without both set.
 
 | Endpoint | What it does |
 |---|---|
@@ -263,10 +264,10 @@ conversation state. Run it with
 3. Otherwise run `handle()`. If the reply is a handoff, the conversation moves
    to `agent`, with the route and blocked reasons as the reason.
 
-Each customer's messages run one at a time, under a per-msisdn lock.
+All of this happens in one database transaction per message (`Store.turn`),
+so it's safe with any number of workers. See `care/state.py` below.
 
 - Every route except `/health` needs `Authorization: Bearer $CARE_API_TOKEN`.
-  The app won't start without the token set.
 - `msisdn` and `area` are trusted, so they must come from the WhatsApp layer,
   never from message text. `msisdn` is 9–15 digits.
 - `text` is capped at 4096 characters, WhatsApp's own limit. Bad input gets a
@@ -284,10 +285,29 @@ Each customer's messages run one at a time, under a per-msisdn lock.
 | `messages` | `message_id` (key), `msisdn`, `received_at`, `route`, `handoff`, `blocked`, `reply` |
 
 Customer text is never stored, only decisions and the reply, which has
-already been redacted. `Store` is SQLite with one connection guarded by a lock,
-so it only works in a single process. For several workers, put the same
-interface on Postgres and swap the per-msisdn lock for a row lock (`SELECT …
-FOR UPDATE`) or per-customer ordering in a queue.
+already been redacted. The schema is in `migrations/` (`alembic upgrade head`).
+
+**Concurrency.** Each inbound message gets one transaction (`Store.turn`) that:
+
+1. takes `pg_advisory_xact_lock` on the msisdn. One customer's messages run one
+   at a time across every worker, while different customers don't wait on each
+   other;
+2. claims the message by inserting its `message_id` first (`ON CONFLICT DO
+   NOTHING`). If the row already exists, it's a redelivery and the stored
+   outcome is returned. Two workers racing on the same message can't both
+   process it, because the second insert waits on the first and then conflicts;
+3. runs the bot and writes the outcome, then commits, which releases the lock.
+
+If a worker dies mid-message, the transaction rolls back along with the claim,
+so WhatsApp's redelivery is processed from scratch. `release` takes the same
+lock, so it can't land mid-message and then be overwritten by that message's
+handoff.
+
+The lock is held through the model call, so each in-flight message holds one
+pooled connection. `Store(url, max_size=10)` caps in-flight messages per
+worker; keep `workers × max_size` under Postgres's `max_connections`.
+Per-customer ordering through a queue (Kafka keyed by msisdn) removes that cost
+later, without changing the schema.
 
 ---
 
@@ -319,7 +339,7 @@ they never reach the model.
 | File | Needs | Covers |
 |---|---|---|
 | `test_core.py` | nothing (uses `FakeLLM`) | Redaction, tool gating and idempotency, price/policy/canary checks, retrieval cut and stale docs, classifier retry/fallback, high-risk regex vs golden labels, zero LLM calls on high-risk, every pipeline handoff path |
-| `test_api.py` | nothing (FakeLLM, temp SQLite) | Answers and status, redelivery dedupe, handoff gives the conversation to an agent and the bot stays quiet, release, state survives restart, no customer text stored, auth, input limits |
+| `test_api.py` | `CARE_TEST_DATABASE_URL` (skipped without it; the tests wipe it) | Answers and status, redelivery dedupe, handoff gives the conversation to an agent and the bot stays quiet, release, state survives restart, no customer text stored, auth, input limits. Across workers: one customer is handled one message at a time, different customers run in parallel, a raced message is processed once, release waits for a message in progress, a crash releases the claim |
 | `test_live.py` | Ollama running | Prompt injection doesn't leak the canary, run 3 times (all must pass) |
 
 `FakeLLM` returns scripted replies in order and counts calls, so tests can

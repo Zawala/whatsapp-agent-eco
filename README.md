@@ -72,7 +72,9 @@ what each module does and how to change it, see
 | `care/llm.py` | The only module that talks to Ollama |
 | `care/tracing.py` | Optional Phoenix tracing |
 | `care/api.py` | FastAPI app the WhatsApp integration calls |
-| `care/state.py` | Conversation state (bot or agent) and message dedupe, in SQLite |
+| `care/state.py` | Conversation state (bot or agent) and message dedupe, in Postgres |
+| `migrations/` | Alembic migrations for the Postgres schema |
+| `compose.yaml` | Postgres for development and tests |
 | `demo.py` | Interactive chat in the terminal |
 | `scripts/simulate.sh` | Simulated WhatsApp traffic against the API |
 | `evals/` | Golden set and the classifier eval runner |
@@ -102,10 +104,23 @@ python demo.py
 
 Each reply shows its route, e.g. `[route=balance handoff=False blocked=[]]`.
 
-Or run it as an API:
+Or run it as an API. It needs Postgres, which `compose.yaml` provides on port
+5433 with a `care` database and a `care_test` database for the tests:
 
 ```bash
-CARE_API_TOKEN=dev uvicorn care.api:create_app --factory --port 8000
+docker compose up -d --wait
+export CARE_DATABASE_URL=postgresql://care:care@localhost:5433/care
+alembic upgrade head
+```
+
+To use a Postgres you already run instead, create the role and databases
+(`CREATE ROLE care LOGIN PASSWORD 'care'`, then `CREATE DATABASE care OWNER
+care` and the same for `care_test`) and point the URLs at it.
+
+Then:
+
+```bash
+CARE_API_TOKEN=dev uvicorn care.api:create_app --factory --port 8000 --workers 4
 
 curl -X POST localhost:8000/messages -H 'Authorization: Bearer dev' \
   -H 'content-type: application/json' \
@@ -115,7 +130,8 @@ curl -X POST localhost:8000/messages -H 'Authorization: Bearer dev' \
 Any handoff gives the conversation to a human agent. After that the bot stays
 quiet (`reply: null`) until `POST /conversations/{msisdn}/release`.
 A repeated `message_id` returns the stored result and isn't processed again.
-State lives in `care.db` (set `CARE_DB` to move it). See
+Workers share the database. One customer's messages run one at a time, while
+different customers run in parallel. See
 [docs/components.md](docs/components.md#careapipy--http-api) for the endpoints.
 
 With the API running, `scripts/simulate.sh` walks through every route, a
@@ -140,6 +156,8 @@ The bot still works; the spans are just dropped.
 ```bash
 pytest                         # offline tests use a scripted fake LLM
 pytest tests/test_live.py      # live tests, skipped unless Ollama is reachable
+CARE_TEST_DATABASE_URL=postgresql://care:care@localhost:5433/care_test pytest tests/test_api.py
+                               # state/API tests; this database gets wiped
 ```
 
 ## Evals

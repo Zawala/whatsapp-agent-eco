@@ -4,7 +4,8 @@
 #   scripts/simulate.sh            # walk through every route and the state rules
 #   scripts/simulate.sh load 10    # 10 bundle questions at once from different numbers
 #
-# Start the API first:  CARE_API_TOKEN=dev uvicorn care.api:create_app --factory
+# Start the API first (needs CARE_DATABASE_URL, see README):
+#   CARE_API_TOKEN=dev uvicorn care.api:create_app --factory
 # Env: BASE_URL (default http://localhost:8000), CARE_API_TOKEN (default dev).
 # Needs curl and jq.
 set -euo pipefail

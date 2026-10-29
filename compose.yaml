@@ -1,0 +1,31 @@
+# Postgres for local development and tests.
+#
+#   docker compose up -d --wait
+#   export CARE_DATABASE_URL=postgresql://care:care@localhost:5433/care
+#   alembic upgrade head
+#
+# Port 5433 on the host so it doesn't clash with a local Postgres on 5432.
+# Creates `care` (the app) and `care_test` (wiped by the tests).
+# Dev credentials only.
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: care
+      POSTGRES_PASSWORD: care
+      POSTGRES_DB: care
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      # Postgres 18 images keep data under /var/lib/postgresql/18/docker.
+      - pgdata:/var/lib/postgresql
+      - ./docker/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Over TCP: the temporary server used for first-time init only listens on a socket.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U care -d care"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  pgdata:
