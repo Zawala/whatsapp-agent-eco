@@ -1,7 +1,7 @@
 """The only module that knows about Ollama. Everything else takes an `llm` callable."""
 from openai import OpenAI
 
-MODEL = "llama3:8b"
+MODEL = "mistral-nemo:latest"
 _client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama", timeout=60)
 
 

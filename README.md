@@ -3,7 +3,7 @@
 A prototype WhatsApp customer-care assistant for a mobile network. It answers
 bundle questions, looks up balances and outages, and logs fault tickets. Anything
 risky or unclear goes to a human. It runs fully locally on a small open model
-(Llama 3 8B via Ollama).
+(Mistral NeMo 12B via Ollama).
 
 The point of the project is the guardrails around the model, not the model itself:
 the LLM only classifies messages and phrases bundle answers. Everything that
@@ -24,12 +24,17 @@ message
        outage        -> get_outage tool
        fault_report  -> create_ticket tool
        bundle_info   -> keyword retrieval + LLM answer
-  -> output checks (prices, policy, canary)   care/checks.py -> human on any violation
+                          -> output checks (prices, policy, canary)   care/checks.py -> human on any violation
   -> redact PII again
   -> reply
 ```
 
 Any exception at any step becomes a human handoff.
+
+For diagrams of every path (pipeline, sequences, classifier contract, tool
+gate, reply outcomes) see [docs/architecture.md](docs/architecture.md). For
+what each module does and how to change it, see
+[docs/components.md](docs/components.md).
 
 ### Guardrails
 
@@ -69,6 +74,7 @@ Any exception at any step becomes a human handoff.
 | `demo.py` | Interactive chat in the terminal |
 | `evals/` | Golden set and the classifier eval runner |
 | `tests/` | Offline unit tests and live tests |
+| `docs/` | Architecture diagrams and component reference |
 
 ## Setup
 
@@ -79,7 +85,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt     # includes the spaCy en_core_web_lg model
 
-ollama pull llama3:8b
+ollama pull mistral-nemo
 ollama serve                        # if it isn't already running
 ```
 
@@ -123,7 +129,24 @@ python -m evals.run --baseline evals/results/X.json  # compare with an earlier r
 ```
 
 It reports intent accuracy (overall and per intent), high-risk recall and
-precision, and the fallback rate, and lists every miss.
+precision, the fallback rate and per-message latency, and lists every miss.
+`routed_accuracy` only counts a case when the intent is right and the confidence
+is high enough that the pipeline acts on it rather than handing off.
+
+To compare models on speed vs accuracy:
+
+```bash
+python -m evals.compare                              # every installed Ollama model
+python -m evals.compare --models llama3:8b qwen3:8b
+```
+
+It writes `evals/results/compare-<time>.{json,md,html}`: the full results, a
+matrix (accuracy, fallback, mean/p50/p95 latency, per intent) and a
+speed-vs-accuracy scatter. Models on the Pareto front are flagged, meaning no
+other model is both faster and at least as accurate. Each model gets an untimed
+warm-up call so load time isn't counted. To switch the bot to the winner, set
+`MODEL` in `care/llm.py`. Full details of inputs, metrics and outputs are in
+[docs/evals.md](docs/evals.md).
 
 `evals/routes.jsonl` uses the same format with extra phrasings for every route,
 including messages that look like high-risk requests but aren't. It's handy for
