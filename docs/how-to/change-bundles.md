@@ -31,8 +31,8 @@ Same shape. FAQs have no `price_usd`.
   don't help.
 - **`price_usd` must match the price in `text`.** The allowed prices come from
   `price_usd`, but the model reads `text`. If they differ, every answer about
-  that bundle is blocked. That fails safe, but nothing tests it yet. A test
-  that checks every entry would be a good first contribution.
+  that bundle is blocked. `test_catalogue_prices_match_text` catches a
+  mismatch in any entry, so run the tests after every change.
 
 ## Check it
 

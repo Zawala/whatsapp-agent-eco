@@ -1,0 +1,73 @@
+# Common Zimbabwean (Shona and Ndebele) first names and surnames, redacted from
+# customer messages as PERSON by care/guard.py. One name per line; matching is
+# case-insensitive and whole-word.
+#
+# STARTER LIST: needs review and extending by a native speaker, the same rule
+# as the golden set.
+#
+# Leave out names that are also English words (Blessing, Gift, Precious,
+# Memory, Patience, Prosper, Lovemore…): input redaction runs before
+# retrieval, and "gift" is a catalogue keyword. Those names are still caught
+# when the customer introduces themselves ("my name is Blessing").
+
+# first names
+Anesu
+Bongani
+Chipo
+Fadzai
+Farai
+Kudakwashe
+Kudzai
+Lindiwe
+Mandla
+Munyaradzi
+Nkosana
+Nokuthula
+Nomsa
+Nyasha
+Panashe
+Ropafadzo
+Rumbidzai
+Rutendo
+Ruvimbo
+Shingai
+Sibusiso
+Simbarashe
+Sipho
+Sithabiso
+Tafadzwa
+Takudzwa
+Tapiwa
+Tatenda
+Tawanda
+Tendai
+Thandiwe
+Themba
+Thulani
+Tinashe
+Tonderai
+Tsitsi
+Vimbai
+Zanele
+
+# surnames
+Chikomo
+Chiweshe
+Dube
+Khumalo
+Makoni
+Mapfumo
+Marufu
+Mhlanga
+Mlambo
+Moyo
+Mpofu
+Mutasa
+Ncube
+Ndlovu
+Nkomo
+Nyathi
+Phiri
+Shumba
+Sibanda
+Sithole

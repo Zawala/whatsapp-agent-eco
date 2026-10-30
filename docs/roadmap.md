@@ -25,7 +25,7 @@ Status as of 2026-10-29.
 |---|---|---|---|
 | 7 | A bigger, multilingual eval set | 🟡 | The CI gate is in place (`evals.yml`, nightly). The set is still 31 English cases; it needs hundreds, from real redacted messages, plus Shona and Ndebele cases written or reviewed by native speakers. |
 | 8 | Evaluate bundle answers end to end | ⬜ | Only the classifier is scored. |
-| 9 | Language policy | ⬜ | `language` is detected but ignored. Presidio runs in English only, and it misses first names (see the known bugs below). |
+| 9 | Language policy | ⬜ | `language` is detected but ignored. Presidio runs in English only. Zimbabwean names are now caught by an introduction recognizer and a starter name list (`care/zw_names.txt`), which still needs a native speaker's review. |
 | 10 | Better retrieval | ⬜ | Keyword overlap with no stemming: "a month of data" doesn't match "Monthly". |
 | 11 | Prices out of code | ⬜ | Changing a price in `knowledge.py` needs a deploy. |
 
@@ -40,17 +40,30 @@ Status as of 2026-10-29.
 
 ## Known bugs
 
-Found while writing these docs. Each makes a good first change.
+None open. Known limitations:
 
-- **Spelled-out prices pass the price check.** `checks.run_all("It costs four
-  dollars fifty", {4.5})` returns `[]`, because the `_PRICE` regex only
-  matches digits. Add a test, then decide whether to match words or block
-  them.
-- **Input redaction keeps first names.** "Tendai Moyo" becomes
-  "Tendai `<PERSON>`". The English spaCy model misses many Zimbabwean names.
-- **Nothing checks `price_usd` against the price in `text`** in `knowledge.py`.
-  A mismatch blocks every answer about that bundle (it fails safe). Add a
-  test that checks every entry.
+- **A bare number with no currency word isn't read as a price.** "It costs
+  four fifty" passes the price check. The bundle prompt tells the model to
+  quote prices exactly as written (digits), and every answer seen so far
+  does, but nothing enforces it.
+- **The name list is a starter.** `care/zw_names.txt` needs review and
+  extending by a native speaker. It deliberately leaves out names that are
+  also English words, which are only caught after an introduction ("my name is
+  Blessing").
+
+### Fixed 2026-10-30
+
+- **Spelled-out prices passed the price check.** `checks.py` now reads amounts
+  written with currency words ("four dollars fifty", "a dollar and a half",
+  "fifty cents", "4 dollars 50") and checks them against the allowed prices
+  like digits. A phrase that looks like an amount but doesn't parse ("four five
+  dollars") is blocked as `price_unparsed`.
+- **Input redaction kept first names** ("Tendai Moyo" became
+  "Tendai `<PERSON>`"). `guard.py` adds a recognizer for introduced names
+  ("I'm …", "this is …", "my name is …") and a deny list of common Shona and
+  Ndebele names.
+- **Nothing checked `price_usd` against the price in `text`.**
+  `test_catalogue_prices_match_text` now checks every catalogue entry.
 
 ## Phases
 

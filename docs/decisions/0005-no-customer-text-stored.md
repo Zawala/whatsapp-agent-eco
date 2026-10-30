@@ -40,5 +40,5 @@ Store **decisions, not messages**:
   ([debug a reply](../how-to/debug-a-reply.md)). Golden cases must be written
   or redacted by hand.
 - **Redaction gaps** matter less here because nothing inbound is stored. They
-  still matter for what the model sees (see the first-name gap in
-  [learn: guardrails](../learn/03-guardrails.md#step-5-pii-redaction-including-a-known-gap)).
+  still matter for what the model sees. Zimbabwean names needed their own
+  recognizers (see [learn: guardrails](../learn/03-guardrails.md#step-5-pii-redaction)).

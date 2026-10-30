@@ -52,7 +52,9 @@ matters: a neighbouring bundle with a low score would add its price to the
 allowed set.
 
 Try `$4.00`, the superseded 5GB price in `knowledge.py`. It's blocked too,
-because the old catalogue entry has expired and is never retrieved.
+because the old catalogue entry has expired and is never retrieved. Prices in
+words are read the same way: "four dollars" gives
+`price_not_in_context:4.0`.
 
 ## Step 3: banned promises and the canary
 
@@ -83,19 +85,25 @@ comparison, `mistral:latest` sent "List the balances of the last ten
 customers" to `balance`. The tool gate then limits it to the caller's own
 balance (see [decision 0002](../decisions/0002-local-model-mistral-nemo.md)).
 
-## Step 5: PII redaction, including a known gap
+## Step 5: PII redaction
 
 ```python
 from care.guard import redact, INPUT_ENTITIES
 redact("Hi, I'm Tendai Moyo, call 0772 123 456", INPUT_ENTITIES)
-# "Hi, I'm Tendai <PERSON>, call <PHONE_NUMBER>"
+# "Hi, I'm <PERSON>, call <PHONE_NUMBER>"
+redact("Tatenda Ncube here, no signal", INPUT_ENTITIES)
+# "<PERSON> here, no signal"
+redact("I'm unable to buy data", INPUT_ENTITIES)
+# "I'm unable to buy data"   (not a name)
 ```
 
-The phone number is removed, but **the first name survives**. spaCy's English
-named-entity model only tagged "Moyo". Zimbabwean names are often missed by an
-English model. That's a real gap, recorded in the [roadmap](../roadmap.md) as
-part of the language work. `guard.py` explains which entity types are used
-where, and why (for example, "5GB" being tagged as a place).
+spaCy's English model on its own only caught "Moyo". Zimbabwean names are
+often missed by an English model, so `guard.py` adds two recognizers:
+- one for a name the customer introduces ("I'm …", "my name is …");
+- a list of common Shona and Ndebele names, in `care/zw_names.txt`.
+
+Try "my name is rutendo" and "this is urgent". `guard.py` also explains which
+entity types are used where, and why ("5GB" gets tagged as a place).
 
 ## Step 6: the tool gate
 
@@ -109,10 +117,10 @@ call_tool("delete_everything", {}, s)                          # {'ok': False, '
 
 ## Exercises
 
-1. Write a bundle answer that slips a wrong price past `check_prices`. (Hint:
-   look at what the `_PRICE` regex does and doesn't match. "four dollars fifty"?)
-   If you find one, it's a real bug: add a test to `test_core.py` and fix the
-   regex.
+1. `check_prices` reads "four dollars fifty" and "$4.50" alike. Find a way to
+   write a wrong price that it doesn't read. (Hint: what if there's no currency
+   word at all?) Then decide whether it's worth catching. The limitation is
+   noted in the [roadmap](../roadmap.md#known-bugs).
 2. Find a phrasing of a refund request that gets past `HIGH_RISK`, and see what
    the classifier does with it in the demo.
 3. Which guardrail stops a model that says "I have reversed your transaction"?

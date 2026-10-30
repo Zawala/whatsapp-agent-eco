@@ -146,17 +146,25 @@ function returns a list of violation strings; empty means clean.
 
 | Name | Catches | Violation string |
 |---|---|---|
-| `check_prices(answer, allowed)` | Any price (`$1`, `US$ 2`, `2.00 USD`, `2 dollars`…) not in the retrieved docs | `price_not_in_context:<p>` |
+| `check_prices(answer, allowed)` | Any price not in the retrieved docs, in digits (`$1`, `US$ 2`, `2.00 USD`, `2.00$`) or with a currency word (`2 dollars`, `four dollars fifty`, `a dollar and a half`, `fifty cents`); and any amount in words that doesn't parse | `price_not_in_context:<p>`, `price_unparsed:<words>` |
 | `check_policy(answer)` | "guarantee", "refund", "free forever", "I reversed", "your PIN is", "I swapped your SIM" | `banned:<pattern>` |
 | `check_canary(answer)` | The `CANARY` string (signals a system-prompt leak) | `canary_leak` |
 | `run_all(answer, allowed_prices)` | All three, concatenated | |
-| `prices_in(text)` | Helper: every price in a string as a rounded float | |
+| `prices_in(text)` | Helper: every price in a string, in digits or words, as a rounded float. Also used by `test_catalogue_prices_match_text`. | |
 
 **Design notes**
 
 - The canary lives in the bundle-answer system prompt. If it ever shows up in
   output, the model was talked into revealing its instructions.
 - Any violation → handoff; the bad answer is never sent, even partially.
+- Two matchers read prices. `_PRICE` handles symbol forms; `_word_prices`
+  tokenises the text and reads the number around every currency word, using
+  `_words_to_number` (0–999, "a", "half a", "point"). Cents after the dollar
+  word count when they look like cents ("fifty", "50") or say "cents", so
+  "2 dollars, 7 days" stays $2. A currency word with no number ("the dollar
+  bundle") isn't a price.
+- **Not read as a price:** a bare number with no currency word ("four fifty").
+  The bundle prompt asks for prices exactly as written, in digits.
 
 ---
 
@@ -169,6 +177,8 @@ output before the customer sees it.
 |---|---|
 | `zw_phone` | Custom recogniser: `+263 7x xxx xxxx` / `07x xxx xxxx`. |
 | `zw_id` | Custom recogniser: Zimbabwean national ID, e.g. `63-123456 K 42`. |
+| `IntroducedNameRecognizer` | `PERSON` for the 1–3 words after "I'm", "I am", "this is", "it's" (capitalised) or "my name is" (any case). Skips non-names such as "I'm unable", "this is urgent", and stops at words such as "and". |
+| `zw_names` | `PERSON` deny list of common Shona and Ndebele names, loaded from `care/zw_names.txt`; case-insensitive, whole words. |
 | `OUTPUT_ENTITIES` | `ZW_PHONE`, `ZW_NATIONAL_ID`, `PHONE_NUMBER`, `EMAIL_ADDRESS`, `CREDIT_CARD`, `IBAN_CODE`. |
 | `INPUT_ENTITIES` | `OUTPUT_ENTITIES` + `PERSON`. |
 | `redact(text, entities=None) -> str` | Presidio analyse + anonymise; replaces hits with `<ENTITY_TYPE>`. |
@@ -177,6 +187,12 @@ output before the customer sees it.
 
 - `PERSON` is input-only: spaCy tags invented bundle names as people, which
   would mangle answers on the way out.
+- The English spaCy model misses many Zimbabwean names ("Tendai Moyo" came
+  out as "Tendai `<PERSON>`"), hence the two extra `PERSON` recognizers.
+  `zw_names.txt` is a starter list for a native speaker to review. It leaves
+  out names that are also English words (Blessing, Gift, Precious…), because
+  redaction runs before retrieval and "gift" is a catalogue keyword.
+  `test_input_redaction_leaves_the_catalogue_alone` guards that.
 - `LOCATION`, `DATE_TIME` and `NRP` are excluded everywhere: spaCy tags the
   "GB" in "5GB" as a location, which breaks retrieval.
 - `PHONE_NUMBER` stays alongside `ZW_PHONE` because it catches 9-digit numbers

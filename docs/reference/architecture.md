@@ -228,7 +228,7 @@ every way one can be produced.
 | Confidence < 0.6 | the intent, e.g. `balance` | True | `[]` |
 | Tool returned an error | the intent | True | `["tool:not_found"]` etc. |
 | Retrieval found nothing | `bundle_info` | True | `["no_context"]` |
-| Answer failed output checks | `bundle_info` | True | e.g. `["price_not_in_context:4.0", "canary_leak"]` |
+| Answer failed output checks | `bundle_info` | True | e.g. `["price_not_in_context:4.0", "canary_leak"]`, or `["price_unparsed:four five dollars"]` |
 | Any exception | `error` | True | `["exception:<Type>"]` |
 
 ## 8. Observability
